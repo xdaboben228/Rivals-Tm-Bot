@@ -19,6 +19,7 @@ from typing import Optional, List, Tuple, Union, Dict, Any
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     ReplyKeyboardMarkup, 
@@ -75,7 +76,7 @@ logger.info("Инициализация системы Трансфермарк�
 
 # Инициализация объектов Bot и Dispatcher (основа aiogram 3.x)
 # Используем parse_mode="HTML" для поддержки жирного текста, курсива и т.д.
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # ==============================================================================
