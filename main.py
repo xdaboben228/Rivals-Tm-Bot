@@ -1257,3 +1257,474 @@ async def process_custom_text(message: types.Message, state: FSMContext) -> None
         await message.answer("⚠️ Ошибка отправки. Администраторы недоступны.")
         
     await state.clear()
+
+
+Вот третья часть кода, как вы и просили:
+
+```python
+"""
+================================================================================
+ТРАНСФЕРМАРКЕТ БОТ ПО ИГРЕ RIVALS (ROBLOX)
+ЧАСТЬ 3: Управление Клубами, Модерация Анкет, Админ-Панель и Запуск Бота
+================================================================================
+# ==============================================================================
+# 11. ОТМЕНА ДЕЙСТВИЙ И УНИВЕРСАЛЬНЫЕ КОЛБЕКИ
+# ==============================================================================
+
+@dp.callback_query(F.data == "cancel_current_action")
+async def cancel_fsm_action(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """
+    Универсальная кнопка отмены текущего ввода. 
+    Позволяет игроку выйти из любого режима.
+    """
+    await state.clear()
+    await callback.message.edit_text("❌ <b>Действие отменено.</b> Вы вернулись в главное меню.")
+    await callback.answer("Отменено")
+
+# ==============================================================================
+# 12. МОДЕРАЦИЯ АНКЕТ АДМИНИСТРАТОРАМИ
+# ==============================================================================
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def process_anketa_approval(callback: types.CallbackQuery) -> None:
+    """
+    Обрабатывает нажатие кнопки "✅ Принять" администратором.
+    """
+    parts = callback.data.split("_")
+    action_type = parts[1]
+    user_id = int(parts[2])
+    
+    original_text = callback.message.text
+    try:
+        post_content = original_text.split("----------------------------------------")[1].strip()
+    except IndexError:
+        await callback.answer("❌ Ошибка парсинга сообщения. Пост поврежден.", show_alert=True)
+        return
+
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=post_content)
+        await callback.message.edit_text(f"✅ <b>ОДОБРЕНО И ОПУБЛИКОВАНО</b>\n\n{post_content}")
+        await bot.send_message(
+            chat_id=user_id, 
+            text="🎉 <b>Отличные новости!</b> Ваша анкета была проверена администратором и успешно опубликована в канале!"
+        )
+        logger.info(f"Анкета от {user_id} ({action_type}) одобрена админом {callback.from_user.id}")
+    except Exception as e:
+        logger.error(f"Ошибка публикации одобренного поста: {e}")
+        await callback.answer("⚠️ Ошибка публикации в канал. Проверьте права бота.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def process_anketa_rejection(callback: types.CallbackQuery) -> None:
+    """
+    Обрабатывает нажатие кнопки "❌ Отклонить" администратором.
+    """
+    parts = callback.data.split("_")
+    action_type = parts[1]
+    user_id = int(parts[2])
+    
+    await callback.message.edit_text(f"❌ <b>ОТКЛОНЕНО</b>\n\n{callback.message.text}")
+    
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "⚠️ <b>К сожалению, ваша анкета была отклонена модератором.</b>\n"
+                "Возможно, она нарушает правила оформления или содержит ненормативную лексику. "
+                "Попробуйте исправить текст и отправить снова после окончания кулдауна."
+            )
+        )
+        logger.info(f"Анкета от {user_id} ({action_type}) отклонена админом {callback.from_user.id}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления об отклонении: {e}")
+
+# ==============================================================================
+# 13. КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ КЛУБОВ (/invite, /delete, /viewteam)
+# ==============================================================================
+
+@dp.message(Command("invite"))
+async def club_command_invite(message: types.Message) -> None:
+    """Команда /invite [ник]. Приглашает свободного агента в клуб."""
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.answer("⚠️ <b>Использование:</b> <code>/invite [игровой ник]</code>")
+        return
+        
+    target_nickname = args[1].strip()
+    club_data = db_manager.get_club_by_admin_rights(user_id)
+    
+    if not club_data:
+        await message.answer("❌ У вас нет прав администратора в каком-либо клубе.")
+        return
+        
+    club_id = club_data[0]
+    club_name = club_data[1]
+    
+    current_players = db_manager.get_club_players_list(club_id)
+    if len(current_players) >= CLUB_MAX_PLAYERS:
+        await message.answer("❌ <b>Лимит исчерпан!</b> В вашей команде уже 15 игроков. Удалите 1 игрока.")
+        return
+
+    target_data = db_manager.get_user_data_by_nickname(target_nickname)
+    if not target_data:
+        await message.answer(f"❌ Игрок с ником <b>{target_nickname}</b> не найден.")
+        return
+        
+    target_id = target_data[0]
+    
+    if target_id == user_id:
+        await message.answer("❌ Вы не можете пригласить самого себя.")
+        return
+    if target_data[4]:
+        await message.answer("❌ Этот игрок заблокирован.")
+        return
+    if target_data[3] is not None:
+        await message.answer("❌ Этот игрок уже состоит в другом клубе!")
+        return
+    if target_data[5] is not None:
+        await message.answer("❌ Этот игрок завершил карьеру и не может вступить в клуб.")
+        return
+
+    success = db_manager.change_player_club(user_id=target_id, new_club_id=club_id)
+    if success:
+        db_manager.add_transfer_count(club_id)
+        try:
+            await bot.send_message(target_id, f"🎉 <b>Вас подписал клуб!</b>\nТеперь вы игрок команды <b>{club_name}</b>.")
+        except:
+            pass
+            
+        post_text = (
+            "❗️ОФИЦИАЛЬНО: ТРАНСФЕРЫ📍\n\n"
+            f"😎 <b>{target_nickname}</b> - Свободный агент ➡️ <b>{club_name}</b>"
+        )
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text=post_text)
+        except Exception as e:
+            logger.error(f"Ошибка отправки трансфера в канал: {e}")
+            
+        await message.answer(f"✅ <b>Успешно!</b> Игрок <code>{target_nickname}</code> подписан в ваш клуб.")
+    else:
+        await message.answer("⚠️ Произошла непредвиденная ошибка при подписании контракта.")
+
+@dp.message(Command("delete"))
+async def club_command_delete(message: types.Message) -> None:
+    """Команда /delete [ник]. Удаляет игрока из клуба."""
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.answer("⚠️ <b>Использование:</b> <code>/delete [игровой ник]</code>")
+        return
+        
+    target_nickname = args[1].strip()
+    club_data = db_manager.get_club_by_admin_rights(user_id)
+    
+    if not club_data:
+        await message.answer("❌ У вас нет прав для использования этой команды.")
+        return
+        
+    club_id = club_data[0]
+    owner_id = club_data[2]
+    
+    target_data = db_manager.get_user_data_by_nickname(target_nickname)
+    if not target_data:
+        await message.answer("❌ Игрок не найден.")
+        return
+        
+    target_id = target_data[0]
+    
+    if target_id == owner_id:
+        await message.answer("❌ Владельца клуба невозможно кикнуть!")
+        return
+        
+    if target_data[3] != club_id:
+        await message.answer("❌ Этот игрок не состоит в вашем клубе.")
+        return
+
+    db_manager.remove_club_deputy(club_id=club_id, deputy_id=target_id)
+    success = db_manager.change_player_club(user_id=target_id, new_club_id=None)
+    
+    if success:
+        try:
+            await bot.send_message(target_id, "💔 <b>Контракт расторгнут.</b>\nВы были исключены из клуба и теперь являетесь свободным агентом.")
+        except:
+            pass
+        await message.answer(f"✅ Игрок <code>{target_nickname}</code> успешно исключен из команды.")
+    else:
+        await message.answer("⚠️ Ошибка при удалении игрока.")
+
+@dp.message(Command("viewteam"))
+@dp.message(F.text == "🛡 Мой клуб")
+async def club_command_viewteam(message: types.Message) -> None:
+    """Команда /viewteam (или кнопка Мой клуб). Показывает статистику клуба и состав."""
+    user_id = message.from_user.id
+    club_data = db_manager.get_club_by_admin_rights(user_id)
+    
+    if not club_data:
+        await message.answer("❌ Вы не являетесь владельцем или заместителем ни в одном клубе.")
+        return
+        
+    club_id = club_data[0]
+    club_name = club_data[1]
+    owner_id = club_data[2]
+    deputy1_id = club_data[3]
+    deputy2_id = club_data[4]
+    transfers_count = club_data[5]
+
+    owner_data = db_manager.get_user_data_by_id(owner_id)
+    owner_nick = owner_data[2] if owner_data else "Неизвестно"
+    
+    dep1_nick = "Нету"
+    if deputy1_id:
+        d1 = db_manager.get_user_data_by_id(deputy1_id)
+        if d1: dep1_nick = f"{d1[2]} (ID: {deputy1_id})"
+        
+    dep2_nick = "Нету"
+    if deputy2_id:
+        d2 = db_manager.get_user_data_by_id(deputy2_id)
+        if d2: dep2_nick = f"{d2[2]} (ID: {deputy2_id})"
+
+    players = db_manager.get_club_players_list(club_id)
+    
+    msg_text = (
+        "📋Даные клуба 📝\n"
+        "─────────────────────────────\n"
+        f"📊Названия клуба: <b>{club_name}</b>\n"
+        f"👑 Владелец: {owner_nick} (ID: {owner_id})\n"
+        f"👤Помощник 1: {dep1_nick}\n"
+        f"👤Помощник 2: {dep2_nick}\n"
+        f"📊 Успешных переходов: {transfers_count}\n"
+        "🏆─────────────────────────────🏆\n\n"
+        f"👥 Состав команды ({len(players)}/15): лимит 15 если владелец захочет добавить игрока когда их уже 15 то ему напишет удалите 1 игрока лимит исчерпан\n"
+    )
+    
+    for i in range(1, 16):
+        if i <= len(players):
+            player_nick = players[i-1][1]
+            msg_text += f" {i}. ✏️ {player_nick}\n"
+        else:
+            msg_text += f" {i}. ✏️ \n"
+
+    reply_markup = None
+    if user_id == owner_id:
+        reply_markup = get_club_management_inline()
+        
+    await message.answer(text=msg_text, reply_markup=reply_markup)
+
+@dp.callback_query(F.data == "club_add_deputy")
+async def process_add_deputy(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Кнопка добавления зама."""
+    await callback.message.answer(
+        "✍️ <b>Добавление заместителя:</b>\nВведите игровой ник игрока, которого хотите назначить замом (он уже должен состоять в вашем клубе):",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await state.set_state(ClubManagementProcess.waiting_for_deputy_nickname)
+    await state.update_data(action="add")
+    await callback.answer()
+
+@dp.callback_query(F.data == "club_remove_deputy")
+async def process_remove_deputy(callback: types.CallbackQuery, state: FSMContext) -> None:
+    """Кнопка снятия зама."""
+    await callback.message.answer(
+        "✍️ <b>Снятие заместителя:</b>\nВведите игровой ник заместителя, которого хотите разжаловать:",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await state.set_state(ClubManagementProcess.waiting_for_deputy_nickname)
+    await state.update_data(action="remove")
+    await callback.answer()
+
+@dp.message(StateFilter(ClubManagementProcess.waiting_for_deputy_nickname))
+async def handle_deputy_nickname(message: types.Message, state: FSMContext) -> None:
+    target_nick = message.text.strip()
+    user_id = message.from_user.id
+    
+    club_data = db_manager.get_club_by_admin_rights(user_id)
+    if not club_data or club_data[2] != user_id:
+        await message.answer("❌ У вас нет прав владельца клуба.")
+        await state.clear()
+        return
+        
+    club_id = club_data[0]
+    state_data = await state.get_data()
+    action = state_data.get("action")
+    
+    target_user = db_manager.get_user_data_by_nickname(target_nick)
+    if not target_user:
+        await message.answer("❌ Игрок с таким ником не найден.")
+        await state.clear()
+        return
+        
+    target_id = target_user[0]
+    
+    if action == "add":
+        if target_user[3] != club_id:
+            await message.answer("❌ Игрок должен сначала вступить в ваш клуб.")
+            await state.clear()
+            return
+            
+        result = db_manager.assign_club_deputy(club_id, target_id)
+        if result == 'success':
+            await message.answer(f"✅ Игрок <code>{target_nick}</code> успешно назначен вашим заместителем.")
+        elif result == 'full':
+            await message.answer("❌ Лимит заместителей (2) исчерпан! Сначала удалите кого-то.")
+        else:
+            await message.answer("⚠️ Произошла ошибка БД.")
+            
+    elif action == "remove":
+        success = db_manager.remove_club_deputy(club_id, target_id)
+        if success:
+            await message.answer(f"✅ Игрок <code>{target_nick}</code> больше не является вашим заместителем.")
+        else:
+            await message.answer("❌ Этот игрок не является вашим заместителем.")
+            
+    await state.clear()
+
+# ==============================================================================
+# 14. СЕКРЕТНАЯ АДМИН ПАНЕЛЬ ДЛЯ ВЛАДЕЛЬЦЕВ БОТА
+# ==============================================================================
+
+@dp.message(F.text == "⚙️ Админ Панель")
+async def superadmin_panel_open(message: types.Message) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("🛡 <b>Вход в Админ Панель выполнен.</b> Выберите действие:", reply_markup=get_superadmin_menu())
+
+@dp.message(F.text == "🔙 Выйти из админ панели")
+async def superadmin_panel_close(message: types.Message) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("Вы вышли из админ-панели.", reply_markup=get_player_main_menu(message.from_user.id, True))
+
+@dp.message(F.text == "➕ Добавить клуб")
+async def superadmin_add_club_start(message: types.Message, state: FSMContext) -> None:
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Введите <b>название</b> нового клуба:", reply_markup=get_cancel_inline_keyboard())
+    await state.set_state(SuperAdminProcess.waiting_for_club_name)
+
+@dp.message(StateFilter(SuperAdminProcess.waiting_for_club_name))
+async def superadmin_add_club_name(message: types.Message, state: FSMContext) -> None:
+    await state.update_data(club_name=message.text.strip())
+    await message.answer("Теперь введите <b>Telegram ID</b> будущего владельца клуба (только цифры):", reply_markup=get_cancel_inline_keyboard())
+    await state.set_state(SuperAdminProcess.waiting_for_club_owner_id)
+
+@dp.message(StateFilter(SuperAdminProcess.waiting_for_club_owner_id))
+async def superadmin_add_club_owner(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    club_name = data.get("club_name")
+    
+    if not message.text.isdigit():
+        await message.answer("❌ ID должен состоять только из цифр. Попробуйте еще раз:")
+        return
+        
+    owner_id = int(message.text)
+    user_data = db_manager.get_user_data_by_id(owner_id)
+    if not user_data:
+        await message.answer(f"❌ Пользователь с ID {owner_id} не зарегистрирован в боте. Операция отменена.")
+        await state.clear()
+        return
+
+    success = db_manager.create_new_club(club_name=club_name, owner_id=owner_id)
+    if success:
+        await message.answer(f"✅ <b>Успешно!</b> Клуб <b>{club_name}</b> создан. Владелец: {user_data[2]}")
+    else:
+        await message.answer("❌ Ошибка: Клуб с таким названием уже существует или произошел сбой.")
+    await state.clear()
+
+@dp.message(F.text == "➖ Убрать клуб")
+async def superadmin_remove_club_start(message: types.Message) -> None:
+    if message.from_user.id not in ADMIN_IDS: return
+    
+    clubs = db_manager.get_all_clubs()
+    if not clubs:
+        await message.answer("В базе данных нет зарегистрированных клубов.")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for club_id, club_name in clubs:
+        builder.button(text=f"🗑 {club_name}", callback_data=f"delclub_{club_id}")
+    
+    builder.adjust(1)
+    await message.answer("Выберите клуб для полного удаления:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("delclub_"))
+async def superadmin_confirm_delete_club(callback: types.CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS: return
+    
+    club_id = int(callback.data.split("_")[1])
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚠️ ДА, УДАЛИТЬ КЛУБ", callback_data=f"confirmdel_{club_id}")
+    builder.button(text="❌ ОТМЕНА", callback_data="cancel_current_action")
+    
+    await callback.message.edit_text("Вы уверены? Это расформирует состав и удалит клуб навсегда.", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("confirmdel_"))
+async def superadmin_execute_delete_club(callback: types.CallbackQuery) -> None:
+    if callback.from_user.id not in ADMIN_IDS: return
+    
+    club_id = int(callback.data.split("_")[1])
+    success = db_manager.delete_club_fully(club_id)
+    
+    if success:
+        await callback.message.edit_text("✅ <b>Клуб успешно и безвозвратно удален.</b> Все игроки стали свободными агентами.")
+    else:
+        await callback.message.edit_text("❌ Ошибка при удалении клуба.")
+
+@dp.message(F.text == "🚫 Забанить игрока")
+async def superadmin_ban_start(message: types.Message, state: FSMContext) -> None:
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Введите игровой ник нарушителя для <b>БЛОКИРОВКИ</b>:", reply_markup=get_cancel_inline_keyboard())
+    await state.set_state(SuperAdminProcess.waiting_for_ban_nickname)
+
+@dp.message(StateFilter(SuperAdminProcess.waiting_for_ban_nickname))
+async def superadmin_ban_execute(message: types.Message, state: FSMContext) -> None:
+    target_nick = message.text.strip()
+    success = db_manager.change_ban_status(nickname=target_nick, is_banned=1)
+    
+    if success:
+        await message.answer(f"✅ Игрок <code>{target_nick}</code> забанен. Он больше не может писать объявления.")
+    else:
+        await message.answer("❌ Игрок не найден.")
+    await state.clear()
+
+@dp.message(F.text == "✅ Разбанить игрока")
+async def superadmin_unban_start(message: types.Message, state: FSMContext) -> None:
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Введите игровой ник игрока для <b>РАЗБЛОКИРОВКИ</b>:", reply_markup=get_cancel_inline_keyboard())
+    await state.set_state(SuperAdminProcess.waiting_for_unban_nickname)
+
+@dp.message(StateFilter(SuperAdminProcess.waiting_for_unban_nickname))
+async def superadmin_unban_execute(message: types.Message, state: FSMContext) -> None:
+    target_nick = message.text.strip()
+    success = db_manager.change_ban_status(nickname=target_nick, is_banned=0)
+    
+    if success:
+        await message.answer(f"✅ Игрок <code>{target_nick}</code> успешно разбанен.")
+    else:
+        await message.answer("❌ Игрок не найден.")
+    await state.clear()
+
+# ==============================================================================
+# 15. ЗАПУСК БОТА (MAIN)
+# ==============================================================================
+
+async def main() -> None:
+    """Точка входа. Запуск процесса polling."""
+    logger.info("Бот Трансфермаркета успешно запущен и готов к работе!")
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.critical(f"Критическая ошибка работы бота: {e}")
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот был выключен вручную (KeyboardInterrupt).")
+
+```
