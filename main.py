@@ -1727,4 +1727,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот был выключен вручную (KeyboardInterrupt).")
 
-```
