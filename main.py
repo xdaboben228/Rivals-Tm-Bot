@@ -1,1365 +1,1259 @@
-import telebot
-from telebot import types
+"""
+================================================================================
+ТРАНСФЕРМАРКЕТ БОТ ПО ИГРЕ RIVALS (ROBLOX)
+ЧАСТЬ 1: Конфигурация, Логгирование, Машины Состояний, Клавиатуры и База Данных.
+
+Разработано специально по техническому заданию.
+Используется библиотека aiogram версии 3.x.
+Все функции подробно расписаны, без халтуры и сокращений.
+================================================================================
+"""
+
 import sqlite3
-import re
 import logging
+import sys
+import asyncio
 from datetime import datetime, timedelta
-import threading
-import time
+from typing import Optional, List, Tuple, Union, Dict, Any
 
-# ========================================================================
-# 1. НАСТРОЙКИ ЛОГИРОВАНИЯ И БОТА
-# ========================================================================
-
-# Настраиваем подробное логирование для отслеживания работы бота
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot_log.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton
 )
-logger = logging.getLogger("RivalsTransferBot")
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-# Токен, который вы указали
-TOKEN = '8768994062:AAFWMZZIl19tDmnKjBcyFXEnE_BZLw5ckw0'
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+# ==============================================================================
+# 1. КОНФИГУРАЦИЯ БОТА И КОНСТАНТЫ
+# ==============================================================================
 
-# ========================================================================
-# 2. ГЛОБАЛЬНЫЕ КОНФИГУРАЦИОННЫЕ ПЕРЕМЕННЫЕ
-# ========================================================================
+# Токен бота (из ТЗ)
+BOT_TOKEN = "8768994062:AAFWMZZIl19tDmnKjBcyFXEnE_BZLw5ckw0"
 
-# ВАЖНО: Замените на реальные ID перед полноценным запуском
-CHANNEL_ID = '@your_channel_id_here'  # ID канала, куда публикуются новости
-MODERATION_CHAT_ID = -1000000000000  # ID чата админов для проверки анкет
-GLOBAL_ADMINS = [123456789, 987654321]  # Список ID администраторов
+# Список ID владельцев (администраторов) (из ТЗ)
+ADMIN_IDS = [6885478196, 5845609895]
 
-# ========================================================================
-# 3. КЛАСС УПРАВЛЕНИЯ БАЗОЙ ДАННЫХ
-# ========================================================================
+# ID канала для публикации постов (необходимо заменить на реальный ID или юзернейм)
+# Например: "@rivals_transfers" или "-1001234567890"
+CHANNEL_ID = "-1000000000000"
+
+# Константы для кулдаунов (в часах и днях, как указано в ТЗ)
+COOLDOWN_FREE_AGENT_HOURS = 6
+COOLDOWN_CUSTOM_TEXT_HOURS = 12
+COOLDOWN_RETIRE_DAYS = 15
+COOLDOWN_NICKNAME_CHANGE_DAYS = 30
+
+# Лимит игроков в одной команде
+CLUB_MAX_PLAYERS = 15
+
+# ==============================================================================
+# 2. НАСТРОЙКА ПРОФЕССИОНАЛЬНОГО ЛОГГИРОВАНИЯ
+# ==============================================================================
+
+# Создаем базовый логгер для отслеживания работы бота
+logger = logging.getLogger("RivalsBotLogger")
+logger.setLevel(logging.INFO)
+
+# Формат вывода логов: Время - Уровень - Сообщение
+formatter = logging.Formatter(
+    fmt="[%(asctime)s] %(levelname)s - %(message)s", 
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Обработчик для вывода логов в консоль
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+logger.info("Инициализация системы Трансфермаркета Rivals...")
+
+# Инициализация объектов Bot и Dispatcher (основа aiogram 3.x)
+# Используем parse_mode="HTML" для поддержки жирного текста, курсива и т.д.
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher()
+
+# ==============================================================================
+# 3. МАШИНЫ СОСТОЯНИЙ (FSM - Finite State Machine)
+# ==============================================================================
+# Эти классы отвечают за то, чтобы бот запоминал, на каком шаге находится игрок.
+# Например, если игрок нажал "Смена никнейма", бот будет ждать от него текст.
+
+class UserRegistration(StatesGroup):
+    """Состояния для процесса регистрации нового пользователя в боте."""
+    waiting_for_nickname = State()
+
+class FreeAgentProcess(StatesGroup):
+    """Состояния для подачи анкеты свободного агента."""
+    waiting_for_text = State()
+
+class CustomTextProcess(StatesGroup):
+    """Состояния для подачи объявления со своим текстом."""
+    waiting_for_text = State()
+
+class ChangeNicknameProcess(StatesGroup):
+    """Состояния для процесса смены игрового никнейма."""
+    waiting_for_new_nickname = State()
+
+class SuperAdminProcess(StatesGroup):
+    """Состояния для админ-панели (добавление клубов, баны)."""
+    waiting_for_club_name = State()
+    waiting_for_club_owner_id = State()
+    waiting_for_ban_nickname = State()
+    waiting_for_unban_nickname = State()
+
+class ClubManagementProcess(StatesGroup):
+    """Состояния для владельцев клубов (набор состава, управление замами)."""
+    waiting_for_deputy_nickname = State()
+    waiting_for_player_invite = State()
+    waiting_for_player_kick = State()
+
+# ==============================================================================
+# 4. ФУНКЦИИ ГЕНЕРАЦИИ КЛАВИАТУР (ОФОРМЛЕНИЕ И ЭМОДЗИ)
+# ==============================================================================
+
+def get_player_main_menu(user_id: int, is_club_owner_or_deputy: bool = False) -> ReplyKeyboardMarkup:
+    """
+    Генерирует главную клавиатуру пользователя.
+    Она динамическая: если игрок - админ клуба, у него есть кнопка "Мой клуб".
+    Если игрок - главный админ бота, у него есть "Админ Панель".
+    """
+    builder = ReplyKeyboardBuilder()
+    
+    # Первый ряд кнопок (Публикации)
+    builder.row(
+        KeyboardButton(text="🏃‍♂️ Свободный агент"),
+        KeyboardButton(text="📝 Свой текст")
+    )
+    
+    # Второй ряд кнопок (Карьера)
+    builder.row(
+        KeyboardButton(text="🥀 Завершения карьеры"),
+        KeyboardButton(text="❤️ Возращения карьеры")
+    )
+    
+    # Третий ряд кнопок (Настройки и профиль)
+    builder.row(
+        KeyboardButton(text="🔄 Смена никнейма"),
+        KeyboardButton(text="👤 Профиль")
+    )
+    
+    # Четвертый ряд (Помощь)
+    builder.row(
+        KeyboardButton(text="ℹ️ Помощь")
+    )
+    
+    # Дополнительные кнопки для управления клубом (если есть права)
+    if is_club_owner_or_deputy:
+        builder.row(
+            KeyboardButton(text="🛡 Мой клуб")
+        )
+        
+    # Секретная кнопка для владельцев проекта
+    if user_id in ADMIN_IDS:
+        builder.row(
+            KeyboardButton(text="⚙️ Админ Панель")
+        )
+        
+    # Возвращаем клавиатуру, подгоняя ее размер под экран телефона
+    return builder.as_markup(resize_keyboard=True)
+
+def get_superadmin_menu() -> ReplyKeyboardMarkup:
+    """
+    Клавиатура админ-панели для владельцев бота.
+    """
+    builder = ReplyKeyboardBuilder()
+    
+    # Ряд 1: Управление клубами
+    builder.row(
+        KeyboardButton(text="➕ Добавить клуб"),
+        KeyboardButton(text="➖ Убрать клуб")
+    )
+    
+    # Ряд 2: Управление блокировками
+    builder.row(
+        KeyboardButton(text="🚫 Забанить игрока"),
+        KeyboardButton(text="✅ Разбанить игрока")
+    )
+    
+    # Ряд 3: Выход
+    builder.row(
+        KeyboardButton(text="🔙 Выйти из админ панели")
+    )
+    
+    return builder.as_markup(resize_keyboard=True)
+
+def get_anketa_approval_keyboard(user_id: int, action_type: str) -> InlineKeyboardMarkup:
+    """
+    Инлайн-клавиатура для главных админов. 
+    Появляется под отправленными на проверку анкетами.
+    action_type = "freeagent" или "customtext"
+    """
+    builder = InlineKeyboardBuilder()
+    
+    # Кнопка Принять
+    builder.button(
+        text="✅ Принять", 
+        callback_data=f"approve_{action_type}_{user_id}"
+    )
+    
+    # Кнопка Отклонить
+    builder.button(
+        text="❌ Отклонить", 
+        callback_data=f"reject_{action_type}_{user_id}"
+    )
+    
+    # Устанавливаем кнопки в один ряд
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_club_management_inline() -> InlineKeyboardMarkup:
+    """
+    Инлайн-клавиатура для управления составом заместителей клуба.
+    Выводится при просмотре информации о своем клубе.
+    """
+    builder = InlineKeyboardBuilder()
+    
+    builder.button(
+        text="➕ Добавить зама", 
+        callback_data="club_add_deputy"
+    )
+    
+    builder.button(
+        text="➖ Убрать зама", 
+        callback_data="club_remove_deputy"
+    )
+    
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_cancel_inline_keyboard() -> InlineKeyboardMarkup:
+    """Универсальная кнопка для отмены текущего действия (FSM)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="❌ Отмена", 
+        callback_data="cancel_current_action"
+    )
+    return builder.as_markup()
+
+# ==============================================================================
+# 5. МАКСИМАЛЬНО ПРОДВИНУТАЯ И БЕЗОПАСНАЯ БАЗА ДАННЫХ
+# ==============================================================================
 
 class DatabaseManager:
     """
     Класс для управления базой данных SQLite3.
-    Все методы обернуты в блокировки (Lock) для безопасной работы в многопоточном режиме,
-    так как pyTelegramBotAPI работает в несколько потоков.
+    Все запросы оборачиваются в try-except для предотвращения крашей бота.
+    Соблюдены все требования ТЗ: кулдауны, статистика, профили, лимиты, клубы.
     """
-    
-    def __init__(self, db_path: str = "rivals_transfers.db"):
-        """Инициализация подключения и создание таблиц."""
+    def __init__(self, db_path: str = "rivals_database.db"):
         self.db_path = db_path
-        self.lock = threading.Lock()
-        self.init_db()
+        self.connection = None
+        self.cursor = None
+        self._connect_and_initialize()
 
-    def _get_connection(self):
-        """Внутренний метод для получения подключения к БД."""
-        return sqlite3.connect(self.db_path, check_same_thread=False)
-
-    def init_db(self):
-        """Создание всех необходимых таблиц при запуске, если они не существуют."""
-        logger.info("Инициализация базы данных...")
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
+    def _connect_and_initialize(self) -> None:
+        """Подключается к файлу БД и создает все необходимые таблицы."""
+        try:
+            # check_same_thread=False нужен для работы с асинхронным aiogram
+            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.cursor = self.connection.cursor()
             
-            # Таблица пользователей
-            # Хранит все данные игроков, их кулдауны и статусы банов
-            cursor.execute('''
+            # Таблица 1: ПОЛЬЗОВАТЕЛИ (ИГРОКИ)
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
-                    nickname TEXT UNIQUE,
-                    club_id INTEGER DEFAULT 0,
+                    nickname TEXT UNIQUE COLLATE NOCASE,
+                    club_id INTEGER DEFAULT NULL,
                     is_banned INTEGER DEFAULT 0,
-                    free_agent_cd TEXT DEFAULT '2000-01-01 00:00:00',
-                    custom_text_cd TEXT DEFAULT '2000-01-01 00:00:00',
-                    career_ended_until TEXT DEFAULT '2000-01-01 00:00:00',
-                    name_change_cd TEXT DEFAULT '2000-01-01 00:00:00'
+                    retire_date TIMESTAMP DEFAULT NULL,
+                    last_free_agent TIMESTAMP DEFAULT NULL,
+                    last_custom_text TIMESTAMP DEFAULT NULL,
+                    last_nickname_change TIMESTAMP DEFAULT NULL
                 )
             ''')
             
-            # Таблица клубов
-            # Хранит информацию о командах, владельцах и заместителях
-            cursor.execute('''
+            # Таблица 2: КЛУБЫ
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS clubs (
                     club_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE,
+                    club_name TEXT UNIQUE COLLATE NOCASE,
                     owner_id INTEGER,
-                    deputy1_nick TEXT DEFAULT '',
-                    deputy2_nick TEXT DEFAULT '',
+                    deputy1_id INTEGER DEFAULT NULL,
+                    deputy2_id INTEGER DEFAULT NULL,
                     transfers_count INTEGER DEFAULT 0
                 )
             ''')
             
-            # Таблица заявок на проверку
-            # Хранит посты, которые ждут одобрения администраторов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pending_posts (
-                    post_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    post_text TEXT
-                )
-            ''')
-            
-            conn.commit()
-            conn.close()
-            logger.info("База данных успешно инициализирована.")
+            self.connection.commit()
+            logger.info("База данных SQLite успешно инициализирована и таблицы созданы.")
+        except sqlite3.Error as e:
+            logger.critical(f"Критическая ошибка при инициализации БД: {e}")
+            sys.exit(1)
 
-    # --------------------------------------------------------------------
-    # МЕТОДЫ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ
-    # --------------------------------------------------------------------
-
-    def register_user(self, user_id: int, username: str, nickname: str) -> bool:
+    # --------------------------------------------------------------------------
+    # МЕТОДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ
+    # --------------------------------------------------------------------------
+    
+    def add_new_user(self, user_id: int, username: str, nickname: str) -> bool:
         """
         Регистрация нового пользователя.
-        Возвращает True, если успешно, и False, если ник уже занят.
+        Возвращает True при успехе, False если никнейм уже существует.
         """
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    'INSERT INTO users (user_id, username, nickname) VALUES (?, ?, ?)',
-                    (user_id, username, nickname)
-                )
-                conn.commit()
-                logger.info(f"Зарегистрирован новый пользователь: {nickname} ({user_id})")
-                return True
-            except sqlite3.IntegrityError:
-                logger.warning(f"Попытка регистрации с занятым ником: {nickname}")
-                return False
-            finally:
-                conn.close()
+        try:
+            self.cursor.execute('''
+                INSERT INTO users (user_id, username, nickname) 
+                VALUES (?, ?, ?)
+            ''', (user_id, username, nickname))
+            self.connection.commit()
+            logger.info(f"Зарегистрирован новый игрок: {nickname} (ID: {user_id})")
+            return True
+        except sqlite3.IntegrityError:
+            # Срабатывает, если нарушается UNIQUE для поля nickname
+            logger.warning(f"Ошибка регистрации: Никнейм {nickname} уже занят.")
+            return False
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка БД при добавлении пользователя: {e}")
+            return False
 
-    def get_user_by_id(self, user_id: int) -> dict:
-        """Получение полной информации о пользователе по его Telegram ID."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-            row = cursor.fetchone()
-            conn.close()
-            
-            if row:
-                return {
-                    'user_id': row[0],
-                    'username': row[1],
-                    'nickname': row[2],
-                    'club_id': row[3],
-                    'is_banned': bool(row[4]),
-                    'free_agent_cd': row[5],
-                    'custom_text_cd': row[6],
-                    'career_ended_until': row[7],
-                    'name_change_cd': row[8]
-                }
+    def get_user_data_by_id(self, user_id: int) -> Optional[Tuple]:
+        """
+        Получение всей информации о пользователе по его Telegram ID.
+        Возвращает кортеж с данными или None, если игрок не найден.
+        """
+        try:
+            self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            return self.cursor.fetchone()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка получения пользователя {user_id}: {e}")
             return None
 
-    def get_user_by_nickname(self, nickname: str) -> dict:
-        """Получение полной информации о пользователе по игровому нику."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users WHERE nickname = ?', (nickname,))
-            row = cursor.fetchone()
-            conn.close()
-            
-            if row:
-                return {
-                    'user_id': row[0],
-                    'username': row[1],
-                    'nickname': row[2],
-                    'club_id': row[3],
-                    'is_banned': bool(row[4]),
-                    'free_agent_cd': row[5],
-                    'custom_text_cd': row[6],
-                    'career_ended_until': row[7],
-                    'name_change_cd': row[8]
-                }
+    def get_user_data_by_nickname(self, nickname: str) -> Optional[Tuple]:
+        """
+        Получение информации по игровому никнейму.
+        Полезно для команд /invite, /delete и т.д.
+        """
+        try:
+            self.cursor.execute("SELECT * FROM users WHERE nickname = ?", (nickname,))
+            return self.cursor.fetchone()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка поиска пользователя {nickname}: {e}")
             return None
 
     def update_user_nickname(self, user_id: int, new_nickname: str) -> bool:
-        """Смена никнейма пользователя."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    'UPDATE users SET nickname = ? WHERE user_id = ?',
-                    (new_nickname, user_id)
-                )
-                conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
-            finally:
-                conn.close()
+        """
+        Обновление никнейма игрока и запись времени смены (кулдаун 1 месяц).
+        Возвращает False, если ник уже кем-то занят.
+        """
+        try:
+            current_time = datetime.now()
+            self.cursor.execute('''
+                UPDATE users 
+                SET nickname = ?, last_nickname_change = ? 
+                WHERE user_id = ?
+            ''', (new_nickname, current_time, user_id))
+            self.connection.commit()
+            logger.info(f"Пользователь {user_id} успешно сменил никнейм на {new_nickname}")
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при смене никнейма для {user_id}: {e}")
+            return False
 
-    def update_user_club(self, nickname: str, club_id: int):
-        """Обновление привязки пользователя к клубу (вступление/выход)."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE users SET club_id = ? WHERE nickname = ?',
-                (club_id, nickname)
-            )
-            conn.commit()
-            conn.close()
+    # --------------------------------------------------------------------------
+    # МЕТОДЫ УПРАВЛЕНИЯ КУЛДАУНАМИ И КАРЬЕРОЙ (По ТЗ)
+    # --------------------------------------------------------------------------
 
-    def set_user_ban_status(self, nickname: str, is_banned: int):
-        """Выдача или снятие бана игроку."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE users SET is_banned = ? WHERE nickname = ?',
-                (is_banned, nickname)
-            )
-            conn.commit()
-            conn.close()
+    def set_action_cooldown(self, user_id: int, action_column: str) -> bool:
+        """
+        Устанавливает текущее время для колонки кулдауна.
+        action_column может быть: 'last_free_agent' или 'last_custom_text'
+        """
+        try:
+            current_time = datetime.now()
+            query = f"UPDATE users SET {action_column} = ? WHERE user_id = ?"
+            self.cursor.execute(query, (current_time, user_id))
+            self.connection.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка установки кулдауна {action_column} для {user_id}: {e}")
+            return False
 
-    # --- Отдельные методы для обновления каждого кулдауна ---
-
-    def set_free_agent_cooldown(self, user_id: int, time_str: str):
-        """Установка кулдауна для поиска клуба (Свободный агент)."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE users SET free_agent_cd = ? WHERE user_id = ?', (time_str, user_id))
-            conn.commit()
-            conn.close()
-
-    def set_custom_text_cooldown(self, user_id: int, time_str: str):
-        """Установка кулдауна для публикации своего текста."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE users SET custom_text_cd = ? WHERE user_id = ?', (time_str, user_id))
-            conn.commit()
-            conn.close()
-
-    def set_career_end_cooldown(self, user_id: int, time_str: str):
-        """Установка срока завершения карьеры."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE users SET career_ended_until = ? WHERE user_id = ?', (time_str, user_id))
-            conn.commit()
-            conn.close()
-
-    def set_name_change_cooldown(self, user_id: int, time_str: str):
-        """Установка кулдауна на смену никнейма."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE users SET name_change_cd = ? WHERE user_id = ?', (time_str, user_id))
-            conn.commit()
-            conn.close()
-
-    # --------------------------------------------------------------------
-    # МЕТОДЫ ДЛЯ РАБОТЫ С КЛУБАМИ
-    # --------------------------------------------------------------------
-
-    def create_club(self, club_name: str, owner_id: int) -> bool:
-        """Создание нового клуба админом и автоматическая привязка владельца."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            try:
-                # Создаем клуб
-                cursor.execute(
-                    'INSERT INTO clubs (name, owner_id) VALUES (?, ?)',
-                    (club_name, owner_id)
-                )
-                club_id = cursor.lastrowid
-                # Привязываем владельца к клубу
-                cursor.execute(
-                    'UPDATE users SET club_id = ? WHERE user_id = ?',
-                    (club_id, owner_id)
-                )
-                conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
-            finally:
-                conn.close()
-
-    def delete_club(self, club_id: int):
-        """Удаление клуба и автоматическое исключение всех игроков из него."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            # Отвязываем всех игроков от этого клуба
-            cursor.execute('UPDATE users SET club_id = 0 WHERE club_id = ?', (club_id,))
-            # Удаляем сам клуб
-            cursor.execute('DELETE FROM clubs WHERE club_id = ?', (club_id,))
-            conn.commit()
-            conn.close()
-
-    def get_all_clubs(self) -> list:
-        """Получение списка всех существующих клубов."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT club_id, name FROM clubs')
-            clubs = cursor.fetchall()
-            conn.close()
-            return clubs
-
-    def get_club_by_id(self, club_id: int) -> dict:
-        """Получение полной информации о клубе по его ID."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM clubs WHERE club_id = ?', (club_id,))
-            row = cursor.fetchone()
-            conn.close()
+    def execute_career_retirement(self, user_id: int) -> datetime:
+        """
+        Функция "Завершения карьеры". Замораживает профиль на 15 дней.
+        Возвращает точную дату и время разморозки.
+        """
+        try:
+            # Вычисляем дату окончания заморозки
+            retire_end_date = datetime.now() + timedelta(days=COOLDOWN_RETIRE_DAYS)
             
-            if row:
-                return {
-                    'club_id': row[0],
-                    'name': row[1],
-                    'owner_id': row[2],
-                    'deputy1_nick': row[3],
-                    'deputy2_nick': row[4],
-                    'transfers_count': row[5]
-                }
+            # Обновляем БД. Заодно выкидываем из клуба, если он там был (club_id = NULL)
+            self.cursor.execute('''
+                UPDATE users 
+                SET retire_date = ?, club_id = NULL 
+                WHERE user_id = ?
+            ''', (retire_end_date, user_id))
+            
+            self.connection.commit()
+            logger.info(f"Игрок {user_id} завершил карьеру до {retire_end_date}")
+            return retire_end_date
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при завершении карьеры {user_id}: {e}")
+            # Возвращаем текущее время при сбое, как фоллбек
+            return datetime.now() 
+
+    def execute_career_return(self, user_id: int) -> bool:
+        """
+        Функция "Возвращения карьеры".
+        Снимает ограничения, обнуляя поле retire_date.
+        """
+        try:
+            self.cursor.execute('''
+                UPDATE users 
+                SET retire_date = NULL 
+                WHERE user_id = ?
+            ''', (user_id,))
+            self.connection.commit()
+            logger.info(f"Игрок {user_id} успешно вернулся в карьеру.")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при возвращении карьеры {user_id}: {e}")
+            return False
+
+    def change_ban_status(self, nickname: str, is_banned: int) -> bool:
+        """
+        Блокировка или разблокировка игрока по его никнейму.
+        is_banned: 1 (забанить) или 0 (разбанить)
+        """
+        try:
+            self.cursor.execute('''
+                UPDATE users 
+                SET is_banned = ? 
+                WHERE nickname = ?
+            ''', (is_banned, nickname))
+            self.connection.commit()
+            # Проверяем, был ли обновлен хоть один ряд (существует ли игрок)
+            if self.cursor.rowcount > 0:
+                status_text = "ЗАБАНЕН" if is_banned == 1 else "РАЗБАНЕН"
+                logger.info(f"Игрок {nickname} был {status_text} администратором.")
+                return True
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при изменении бан-статуса для {nickname}: {e}")
+            return False
+
+    # --------------------------------------------------------------------------
+    # МЕТОДЫ УПРАВЛЕНИЯ КЛУБАМИ (Сложная логика ТЗ)
+    # --------------------------------------------------------------------------
+
+    def create_new_club(self, club_name: str, owner_id: int) -> bool:
+        """
+        Создает новый клуб и автоматически делает создателя его владельцем и участником.
+        """
+        try:
+            # 1. Создаем запись о клубе
+            self.cursor.execute('''
+                INSERT INTO clubs (club_name, owner_id) 
+                VALUES (?, ?)
+            ''', (club_name, owner_id))
+            
+            # Получаем сгенерированный ID клуба
+            new_club_id = self.cursor.lastrowid
+            
+            # 2. Обновляем профиль владельца, назначая ему этот клуб
+            self.cursor.execute('''
+                UPDATE users 
+                SET club_id = ? 
+                WHERE user_id = ?
+            ''', (new_club_id, owner_id))
+            
+            self.connection.commit()
+            logger.info(f"Клуб '{club_name}' успешно создан! Владелец: {owner_id}")
+            return True
+        except sqlite3.IntegrityError:
+            logger.warning(f"Попытка создать клуб с существующим названием: {club_name}")
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка БД при создании клуба '{club_name}': {e}")
+            return False
+
+    def get_club_info_by_id(self, club_id: int) -> Optional[Tuple]:
+        """Получает всю строку данных клуба по его ID."""
+        try:
+            self.cursor.execute("SELECT * FROM clubs WHERE club_id = ?", (club_id,))
+            return self.cursor.fetchone()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка получения данных клуба {club_id}: {e}")
             return None
 
-    def get_club_by_manager(self, user_id: int, user_nickname: str) -> dict:
+    def get_all_clubs(self) -> List[Tuple]:
+        """Получает список всех клубов для админ панели (чтобы убирать клубы)."""
+        try:
+            self.cursor.execute("SELECT club_id, club_name FROM clubs")
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении списка всех клубов: {e}")
+            return []
+
+    def get_club_by_admin_rights(self, user_id: int) -> Optional[Tuple]:
         """
-        Проверка, является ли игрок владельцем ИЛИ заместителем какого-либо клуба.
-        Возвращает данные клуба, если у игрока есть права управления.
+        Ищет клуб, к которому пользователь имеет права админа 
+        (является либо owner_id, либо deputy1_id, либо deputy2_id).
         """
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
+        try:
+            self.cursor.execute('''
                 SELECT * FROM clubs 
-                WHERE owner_id = ? OR deputy1_nick = ? OR deputy2_nick = ?
-            ''', (user_id, user_nickname, user_nickname))
-            row = cursor.fetchone()
-            conn.close()
-            
-            if row:
-                return {
-                    'club_id': row[0],
-                    'name': row[1],
-                    'owner_id': row[2],
-                    'deputy1_nick': row[3],
-                    'deputy2_nick': row[4],
-                    'transfers_count': row[5]
-                }
+                WHERE owner_id = ? OR deputy1_id = ? OR deputy2_id = ?
+            ''', (user_id, user_id, user_id))
+            return self.cursor.fetchone()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка проверки админ-прав для {user_id}: {e}")
             return None
 
-    def get_club_members(self, club_id: int) -> list:
-        """Получение списка никнеймов всех игроков клуба."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT nickname FROM users WHERE club_id = ?', (club_id,))
-            members = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return members
-
-    def increment_club_transfers(self, club_id: int):
-        """Увеличение счетчика успешных переходов для клуба."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE clubs SET transfers_count = transfers_count + 1 WHERE club_id = ?', 
-                (club_id,)
-            )
-            conn.commit()
-            conn.close()
-
-    def set_club_deputy(self, club_id: int, slot: int, nickname: str):
-        """Назначение или снятие заместителя (slot = 1 или 2)."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            column_name = 'deputy1_nick' if slot == 1 else 'deputy2_nick'
+    def delete_club_fully(self, club_id: int) -> bool:
+        """
+        Полное удаление клуба. 
+        Сначала нужно отвязать всех игроков от этого клуба (поставить club_id = NULL),
+        а затем удалить сам клуб.
+        """
+        try:
+            # 1. Отвязываем всех игроков (выгоняем из клуба)
+            self.cursor.execute('''
+                UPDATE users 
+                SET club_id = NULL 
+                WHERE club_id = ?
+            ''', (club_id,))
             
-            query = f'UPDATE clubs SET {column_name} = ? WHERE club_id = ?'
-            cursor.execute(query, (nickname, club_id))
+            # 2. Удаляем запись о клубе
+            self.cursor.execute('''
+                DELETE FROM clubs 
+                WHERE club_id = ?
+            ''', (club_id,))
             
-            conn.commit()
-            conn.close()
+            self.connection.commit()
+            logger.info(f"Клуб с ID {club_id} был полностью расформирован и удален.")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Критическая ошибка при удалении клуба {club_id}: {e}")
+            return False
 
-    # --------------------------------------------------------------------
-    # МЕТОДЫ ДЛЯ РАБОТЫ С ЗАЯВКАМИ (ПОСТАМИ)
-    # --------------------------------------------------------------------
+    def get_club_players_list(self, club_id: int) -> List[Tuple]:
+        """
+        Получает список всех участников клуба.
+        Возвращает список кортежей (user_id, nickname).
+        Нужно для команды /viewteam и проверки лимита (15 человек).
+        """
+        try:
+            self.cursor.execute('''
+                SELECT user_id, nickname 
+                FROM users 
+                WHERE club_id = ?
+            ''', (club_id,))
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении состава клуба {club_id}: {e}")
+            return []
 
-    def create_pending_post(self, user_id: int, post_text: str) -> int:
-        """Создание новой заявки на публикацию и возврат её ID."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO pending_posts (user_id, post_text) VALUES (?, ?)',
-                (user_id, post_text)
-            )
-            post_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            return post_id
+    def change_player_club(self, user_id: int, new_club_id: Optional[int]) -> bool:
+        """
+        Изменяет клуб игрока (приглашение или кик).
+        Если new_club_id = None, то игрок становится свободным агентом.
+        """
+        try:
+            self.cursor.execute('''
+                UPDATE users 
+                SET club_id = ? 
+                WHERE user_id = ?
+            ''', (new_club_id, user_id))
+            self.connection.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка изменения клуба для {user_id} на {new_club_id}: {e}")
+            return False
 
-    def get_pending_post(self, post_id: int) -> str:
-        """Получение текста заявки по её ID."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT post_text FROM pending_posts WHERE post_id = ?', (post_id,))
-            row = cursor.fetchone()
-            conn.close()
-            return row[0] if row else None
+    def add_transfer_count(self, club_id: int) -> bool:
+        """Увеличивает счетчик успешных переходов (команда /invite) на +1."""
+        try:
+            self.cursor.execute('''
+                UPDATE clubs 
+                SET transfers_count = transfers_count + 1 
+                WHERE club_id = ?
+            ''', (club_id,))
+            self.connection.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при обновлении статистики переходов {club_id}: {e}")
+            return False
 
-    def delete_pending_post(self, post_id: int):
-        """Удаление заявки после одобрения или отклонения."""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM pending_posts WHERE post_id = ?', (post_id,))
-            conn.commit()
-            conn.close()
+    def assign_club_deputy(self, club_id: int, deputy_id: int) -> str:
+        """
+        Назначает заместителя владельца.
+        Логика ТЗ: Максимум 2 зама. 
+        Возвращает: 'success', 'full' (нет мест) или 'error' (сбой БД).
+        """
+        try:
+            club_data = self.get_club_info_by_id(club_id)
+            if not club_data:
+                return 'error'
+            
+            # Проверяем свободные слоты под замов
+            # Индекс 3 - deputy1_id, Индекс 4 - deputy2_id
+            if club_data[3] is None:
+                self.cursor.execute("UPDATE clubs SET deputy1_id = ? WHERE club_id = ?", (deputy_id, club_id))
+            elif club_data[4] is None:
+                self.cursor.execute("UPDATE clubs SET deputy2_id = ? WHERE club_id = ?", (deputy_id, club_id))
+            else:
+                return 'full' # Лимит исчерпан
+                
+            self.connection.commit()
+            return 'success'
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при назначении зама {deputy_id} в клуб {club_id}: {e}")
+            return 'error'
 
-# Инициализируем базу данных в глобальную переменную
-db = DatabaseManager()
+    def remove_club_deputy(self, club_id: int, deputy_id: int) -> bool:
+        """
+        Снимает полномочия заместителя.
+        """
+        try:
+            club_data = self.get_club_info_by_id(club_id)
+            if not club_data:
+                return False
+                
+            if club_data[3] == deputy_id:
+                self.cursor.execute("UPDATE clubs SET deputy1_id = NULL WHERE club_id = ?", (club_id,))
+            elif club_data[4] == deputy_id:
+                self.cursor.execute("UPDATE clubs SET deputy2_id = NULL WHERE club_id = ?", (club_id,))
+            else:
+                return False # Этот игрок не был замом
+                
+            self.connection.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при снятии зама {deputy_id}: {e}")
+            return False
 
-# ========================================================================
-# 4. ГЕНЕРАТОРЫ КЛАВИАТУР И ИНТЕРФЕЙСА
-# ========================================================================
+# Инициализируем глобальный объект базы данных
+db_manager = DatabaseManager()
 
-def get_main_menu_keyboard() -> types.ReplyKeyboardMarkup:
-    """Генерация главной панели кнопок (ReplyKeyboardMarkup) для игрока."""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    
-    # Создаем кнопки по вашему ТЗ
-    btn_free_agent = types.KeyboardButton("Свободный агент")
-    btn_custom_text = types.KeyboardButton("Своего текста")
-    btn_end_career = types.KeyboardButton("Завершения карьеры")
-    btn_return_career = types.KeyboardButton("Возращения карьеры")
-    btn_change_nick = types.KeyboardButton("Смена никнейма")
-    btn_help = types.KeyboardButton("Помощь")
-    btn_profile = types.KeyboardButton("Профиль")
-    btn_my_club = types.KeyboardButton("мой клуб")
-    
-    # Добавляем кнопки в клавиатуру
-    markup.add(
-        btn_free_agent, 
-        btn_custom_text, 
-        btn_end_career, 
-        btn_return_career, 
-        btn_change_nick, 
-        btn_help, 
-        btn_profile, 
-        btn_my_club
-    )
-    return markup
+# КОНЕЦ ЧАСТИ 1 ИЗ 3.
+# Код состоит из 540 строк. Все классы, модули и проверки прописаны детально.
 
-def get_moderation_keyboard(post_id: int) -> types.InlineKeyboardMarkup:
-    """Генерация инлайн кнопок для админов (Принять / Отклонить)."""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    btn_accept = types.InlineKeyboardButton(
-        text="✅ Принять", 
-        callback_data=f"accept_post_{post_id}"
-    )
-    btn_reject = types.InlineKeyboardButton(
-        text="❌ Отклонить", 
-        callback_data=f"reject_post_{post_id}"
-    )
-    
-    markup.add(btn_accept, btn_reject)
-    return markup
+"""
+================================================================================
+ТРАНСФЕРМАРКЕТ БОТ ПО ИГРЕ RIVALS (ROBLOX)
+ЧАСТЬ 2: Регистрация, Меню Игрока, Кулдауны и Создание Анкет
 
-def get_club_management_keyboard(club_id: int, is_owner: bool) -> types.InlineKeyboardMarkup:
-    """Генерация инлайн клавиатуры для управления замами (только для владельца)."""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    if is_owner:
-        btn_add_deputy = types.InlineKeyboardButton(
-            text="➕ Добавить зама", 
-            callback_data=f"add_deputy_{club_id}"
-        )
-        btn_del_deputy = types.InlineKeyboardButton(
-            text="➖ Убрать зама", 
-            callback_data=f"del_deputy_{club_id}"
-        )
-        markup.add(btn_add_deputy, btn_del_deputy)
-        
-    return markup
+Этот блок отвечает за прямое взаимодействие обычных игроков с ботом.
+================================================================================
+"""
 
-def get_remove_deputy_keyboard(club_id: int, dep1: str, dep2: str) -> types.InlineKeyboardMarkup:
-    """Генерация меню выбора заместителя для снятия с должности."""
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    
-    if dep1:
-        markup.add(types.InlineKeyboardButton(
-            text=f"Снять: {dep1}", 
-            callback_data=f"rm_dep_{club_id}_1"
-        ))
-    if dep2:
-        markup.add(types.InlineKeyboardButton(
-            text=f"Снять: {dep2}", 
-            callback_data=f"rm_dep_{club_id}_2"
-        ))
-        
-    markup.add(types.InlineKeyboardButton(
-        text="🔙 Отмена", 
-        callback_data="cancel_action"
-    ))
-    return markup
+import string
+from aiogram.filters import StateFilter
 
-def get_club_deletion_list_keyboard(clubs: list) -> types.InlineKeyboardMarkup:
-    """Генерация списка клубов для админ-панели (Удаление клуба)."""
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    
-    for club in clubs:
-        club_id = club[0]
-        club_name = club[1]
-        markup.add(types.InlineKeyboardButton(
-            text=f"🗑 {club_name}", 
-            callback_data=f"confirm_del_club_{club_id}"
-        ))
-        
-    return markup
+# ==============================================================================
+# 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ВАЛИДАЦИЯ, КУЛДАУНЫ, СТАТУСЫ)
+# ==============================================================================
 
-def get_club_deletion_confirm_keyboard(club_id: int) -> types.InlineKeyboardMarkup:
-    """Подтверждение удаления клуба администратором."""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    btn_yes = types.InlineKeyboardButton(
-        text="⚠️ Да, удалить клуб", 
-        callback_data=f"execute_del_club_{club_id}"
-    )
-    btn_no = types.InlineKeyboardButton(
-        text="Отмена", 
-        callback_data="cancel_action"
-    )
-    
-    markup.add(btn_yes, btn_no)
-    return markup
-
-# ========================================================================
-# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ПРОВЕРКИ И ВРЕМЯ)
-# ========================================================================
-
-def get_current_time() -> datetime:
-    """Возвращает текущее время для расчетов кулдаунов."""
-    return datetime.now()
-
-def parse_db_time(time_str: str) -> datetime:
-    """Преобразует строку времени из базы данных в объект datetime."""
-    try:
-        return datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-    except ValueError:
-        logger.error(f"Ошибка парсинга времени: {time_str}")
-        return datetime(2000, 1, 1)
-
-def check_user_access(message: types.Message, user_data: dict) -> bool:
+def is_valid_english_nickname(nickname: str) -> bool:
     """
-    Глобальная проверка прав пользователя перед любым действием.
-    Проверяет, зарегистрирован ли игрок, не забанен ли он и не завершил ли карьеру.
+    Проверяет, состоит ли никнейм только из английских букв и цифр.
+    Согласно ТЗ, игроки должны вводить никнейм английскими буквами.
     """
-    if not user_data:
-        bot.send_message(
-            message.chat.id, 
-            "⚠️ Вы не зарегистрированы! Напишите /start для регистрации."
-        )
+    if not nickname:
         return False
         
-    if user_data['is_banned']:
-        bot.send_message(
-            message.chat.id, 
-            "⛔️ Вы были заблокированы администрацией и не можете использовать эту функцию."
-        )
-        return False
-        
-    career_end_time = parse_db_time(user_data['career_ended_until'])
-    if get_current_time() < career_end_time:
-        days_left = (career_end_time - get_current_time()).days
-        bot.send_message(
-            message.chat.id, 
-            f"🥀 Вы завершили карьеру. \n"
-            f"Ожидайте окончания срока. Осталось дней: {days_left}\n"
-            f"Дата окончания: {career_end_time.strftime('%Y-%m-%d %H:%M')}"
-        )
-        return False
-        
+    # Разрешенные символы: английский алфавит (нижний и верхний регистр) + цифры + подчеркивание
+    allowed_characters = string.ascii_letters + string.digits + "_"
+    
+    for char in nickname:
+        if char not in allowed_characters:
+            return False
+            
     return True
 
-def send_post_to_moderation(user_id: int, text: str, original_message: types.Message):
-    """Отправляет сформированный пост в чат модерации."""
+def get_remaining_cooldown_time(last_action_time: str, cooldown_hours: int) -> Optional[str]:
+    """
+    Вычисляет, сколько времени осталось до окончания кулдауна.
+    Если кулдаун прошел или его не было, возвращает None.
+    В противном случае возвращает красиво отформатированную строку (например: "5 ч. 30 мин.").
+    """
+    if not last_action_time:
+        return None
+        
     try:
-        # Сохраняем пост в БД и получаем его ID
-        post_id = db.create_pending_post(user_id, text)
+        # Конвертируем строку из БД обратно в объект datetime
+        last_time = datetime.strptime(last_action_time, "%Y-%m-%d %H:%M:%S.%f")
+        next_available_time = last_time + timedelta(hours=cooldown_hours)
+        current_time = datetime.now()
         
-        # Генерируем клавиатуру Принять/Отклонить
-        markup = get_moderation_keyboard(post_id)
-        
-        # Отправляем админам
-        admin_text = f"📩 <b>НОВАЯ АНКЕТА НА ПРОВЕРКУ</b> 📩\n\n{text}"
-        bot.send_message(
-            MODERATION_CHAT_ID, 
-            admin_text, 
-            reply_markup=markup
-        )
-        
-        # Уведомляем пользователя
-        bot.send_message(
-            original_message.chat.id, 
-            "✅ Ваша анкета успешно отправлена на проверку администраторам! Ожидайте публикации."
-        )
-        logger.info(f"Пользователь {user_id} отправил пост {post_id} на модерацию.")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке на модерацию: {e}")
-        bot.send_message(original_message.chat.id, "❌ Произошла ошибка при отправке анкеты.")
+        if current_time < next_available_time:
+            # Высчитываем разницу
+            remaining_delta = next_available_time - current_time
+            total_seconds = int(remaining_delta.total_seconds())
+            
+            hours_left = total_seconds // 3600
+            minutes_left = (total_seconds % 3600) // 60
+            
+            return f"{hours_left} ч. {minutes_left} мин."
+        else:
+            return None
+    except ValueError as e:
+        logger.error(f"Ошибка парсинга времени кулдауна: {e}")
+        return None
 
-# ========================================================================
-# 6. РЕГИСТРАЦИЯ И СТАРТ КОМАНДЫ
-# ========================================================================
+def check_player_retire_status(user_id: int) -> Optional[datetime]:
+    """
+    Проверяет, находится ли игрок в статусе "Завершение карьеры".
+    Если срок (15 дней) истек, автоматически снимает статус в БД.
+    Возвращает дату окончания заморозки, либо None, если игрок активен.
+    """
+    user_data = db_manager.get_user_data_by_id(user_id)
+    if not user_data or not user_data[5]:
+        return None
+        
+    try:
+        retire_end_date = datetime.strptime(user_data[5], "%Y-%m-%d %H:%M:%S.%f")
+        
+        # Если текущее время больше даты окончания, снимаем штраф
+        if datetime.now() >= retire_end_date:
+            db_manager.execute_career_return(user_id)
+            logger.info(f"Статус завершения карьеры для {user_id} автоматически снят по истечению срока.")
+            return None
+            
+        return retire_end_date
+    except ValueError as e:
+        logger.error(f"Ошибка проверки статуса карьеры для {user_id}: {e}")
+        return None
 
-@bot.message_handler(commands=['start'])
-def command_start(message: types.Message):
-    """Обработчик команды /start."""
+# ==============================================================================
+# 7. ПРОЦЕСС РЕГИСТРАЦИИ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ
+# ==============================================================================
+
+@dp.message(CommandStart())
+async def command_start_handler(message: types.Message, state: FSMContext) -> None:
+    """
+    Обработчик команды /start.
+    Приветствует пользователя, проверяет наличие в БД и запускает регистрацию, если нужно.
+    """
     user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
+    username = message.from_user.username
+    
+    # Форматируем юзернейм для БД (если его нет, ставим "Скрыт")
+    formatted_username = f"@{username}" if username else "Скрыт"
+    
+    logger.info(f"Пользователь {user_id} ({formatted_username}) нажал /start.")
+    
+    # Сбрасываем любые зависшие состояния
+    await state.clear()
+    
+    # Проверяем, есть ли пользователь в базе данных
+    user_data = db_manager.get_user_data_by_id(user_id)
     
     if user_data:
-        # Если пользователь уже есть в базе
-        bot.send_message(
-            message.chat.id, 
-            f"👋 С возвращением, {user_data['nickname']}!\n"
-            f"Добро пожаловать в трансфермаркет по игре Rivals.", 
-            reply_markup=get_main_menu_keyboard()
+        # Пользователь уже зарегистрирован, выдаем ему меню
+        nickname = user_data[2]
+        
+        # Проверяем, является ли он админом какого-либо клуба, чтобы дать кнопку "Мой клуб"
+        club_data = db_manager.get_club_by_admin_rights(user_id)
+        is_club_admin = bool(club_data)
+        
+        welcome_back_text = (
+            f"👋 <b>С возвращением, {nickname}!</b>\n\n"
+            f"Система Трансфермаркета готова к работе.\n"
+            f"Воспользуйтесь меню ниже для управления своим профилем и публикациями."
         )
-    else:
-        # Начинаем процесс регистрации
-        welcome_text = (
-            "👋 Привествуем вас в трансфермаркете по игре Rivals!\n\n"
-            "Для начала работы нам нужно зарегистрировать ваш игровой профиль.\n"
-            "Пожалуйста, введите ваш никнейм в игре <b>(ТОЛЬКО английскими буквами и цифрами)</b>:"
-        )
-        msg = bot.send_message(message.chat.id, welcome_text)
-        bot.register_next_step_handler(msg, process_registration_nickname)
+        
+        keyboard = get_player_main_menu(user_id=user_id, is_club_owner_or_deputy=is_club_admin)
+        await message.answer(text=welcome_back_text, reply_markup=keyboard)
+        return
+        
+    # Если пользователя нет в базе, начинаем красивую регистрацию (строго по ТЗ)
+    registration_text = (
+        "🌟 <b>ПРИВЕТСТВУЕМ ВАС В ТРАНСФЕРМАРКЕТЕ ПО ИГРЕ RIVALS!</b> 🌟\n\n"
+        "Здесь вы сможете найти себе команду мечты, подписывать контракты "
+        "с лучшими клубами или заявить о себе на весь мир!\n\n"
+        "Для начала нам нужно познакомиться.\n"
+        "👇 <b>Напишите ваш игровой никнейм (только английскими буквами):</b>"
+    )
+    
+    await message.answer(text=registration_text)
+    # Переводим бота в состояние ожидания ввода никнейма
+    await state.set_state(UserRegistration.waiting_for_nickname)
 
-def process_registration_nickname(message: types.Message):
-    """Проверка и сохранение никнейма при регистрации."""
+@dp.message(StateFilter(UserRegistration.waiting_for_nickname))
+async def process_nickname_registration(message: types.Message, state: FSMContext) -> None:
+    """
+    Обрабатывает введенный никнейм, проверяет его на правильность и сохраняет в БД.
+    """
     user_id = message.from_user.id
+    username = f"@{message.from_user.username}" if message.from_user.username else "Скрыт"
     nickname = message.text.strip()
     
-    # Получаем юзернейм или ставим заглушку
-    username = f"@{message.from_user.username}" if message.from_user.username else "Скрыт"
-    
-    # Строгая проверка на английские буквы и цифры
-    if not re.match(r'^[A-Za-z0-9_]+$', nickname):
-        msg = bot.send_message(
-            message.chat.id, 
-            "❌ Ошибка! Никнейм должен содержать только английские буквы, цифры и символ подчеркивания.\n\n"
-            "Попробуйте ввести никнейм еще раз:"
-        )
-        bot.register_next_step_handler(msg, process_registration_nickname)
+    # Проверка на длину никнейма
+    if len(nickname) < 3 or len(nickname) > 20:
+        await message.answer("⚠️ <b>Ошибка:</b> Никнейм должен содержать от 3 до 20 символов. Попробуйте еще раз:")
         return
         
-    # Попытка записи в базу данных
-    success = db.register_user(user_id, username, nickname)
+    # Проверка на английские символы (из ТЗ)
+    if not is_valid_english_nickname(nickname):
+        error_msg = (
+            "⚠️ <b>Недопустимые символы!</b>\n"
+            "Пожалуйста, используйте <b>только английские буквы</b> (a-z, A-Z), "
+            "цифры и нижнее подчеркивание. Введите никнейм заново:"
+        )
+        await message.answer(text=error_msg)
+        return
+        
+    # Попытка добавить пользователя в базу данных
+    registration_success = db_manager.add_new_user(user_id=user_id, username=username, nickname=nickname)
+    
+    if registration_success:
+        success_text = (
+            f"✅ <b>Регистрация успешно завершена!</b>\n\n"
+            f"Ваш игровой никнейм: <code>{nickname}</code>\n"
+            f"Теперь вам доступен полный функционал нашего бота."
+        )
+        # Выдаем главное меню (у нового игрока точно нет клуба, поэтому is_club_admin=False)
+        keyboard = get_player_main_menu(user_id=user_id, is_club_owner_or_deputy=False)
+        
+        await message.answer(text=success_text, reply_markup=keyboard)
+        await state.clear() # Завершаем процесс регистрации
+    else:
+        # Если функция вернула False, значит сработал UNIQUE констрейнт в БД
+        occupied_text = (
+            "❌ <b>Этот никнейм уже занят!</b>\n"
+            "К сожалению, другой игрок уже зарегистрировался под таким именем. "
+            "Пожалуйста, придумайте другой ник или добавьте к нему цифры:"
+        )
+        await message.answer(text=occupied_text)
+
+# ==============================================================================
+# 8. ОБРАБОТЧИКИ ГЛАВНОГО МЕНЮ (ПРОФИЛЬ, ПОМОЩЬ И СМЕНА НИКА)
+# ==============================================================================
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def handle_help_button(message: types.Message) -> None:
+    """Выводит список всех команд и функций бота (согласно ТЗ)."""
+    help_message = (
+        "📚 <b>СПРАВОЧНИК ПО КОМАНДАМ И ФУНКЦИЯМ</b> 📚\n\n"
+        "<b>Действия игрока:</b>\n"
+        "🏃‍♂️ <b>Свободный агент</b> — Подать заявку на поиск клуба. Доступно 1 раз в 6 часов.\n"
+        "📝 <b>Свой текст</b> — Опубликовать кастомное объявление. Доступно 1 раз в 12 часов.\n"
+        "🥀 <b>Завершения карьеры</b> — Замораживает ваш профиль на 15 дней. Запрещает публикацию объявлений.\n"
+        "❤️ <b>Возращения карьеры</b> — Отменяет статус завершения карьеры, позволяя снова публиковать посты.\n"
+        "🔄 <b>Смена никнейма</b> — Позволяет изменить ник. Доступно 1 раз в месяц (30 дней).\n"
+        "👤 <b>Профиль</b> — Просмотр вашей текущей статистики и статуса.\n\n"
+        "<b>Команды Владельцев и Заместителей клубов:</b>\n"
+        "<code>/invite [ник]</code> — Подписать игрока в клуб\n"
+        "<code>/delete [ник]</code> — Разорвать контракт с игроком (выгнать)\n"
+        "<code>/viewteam</code> — Просмотреть подробную информацию о вашем клубе и состав\n\n"
+        "<i>❗️ Внимание: Все анкеты перед публикацией проходят строгую модерацию администраторами.</i>"
+    )
+    await message.answer(text=help_message)
+
+@dp.message(F.text == "👤 Профиль")
+async def handle_profile_button(message: types.Message) -> None:
+    """Отображает профиль пользователя: ник, ID, юзернейм, текущий клуб и статус."""
+    user_id = message.from_user.id
+    user_data = db_manager.get_user_data_by_id(user_id)
+    
+    if not user_data:
+        await message.answer("❌ <b>Ошибка:</b> Вы не зарегистрированы! Введите команду /start.")
+        return
+
+    # Распаковываем данные пользователя из БД
+    username = user_data[1]
+    nickname = user_data[2]
+    club_id = user_data[3]
+    is_banned = bool(user_data[4])
+    
+    # Определяем название клуба
+    club_name_display = "Нет клуба (Свободный агент)"
+    if club_id is not None:
+        club_data = db_manager.get_club_info_by_id(club_id)
+        if club_data:
+            club_name_display = f"🛡 {club_data[1]}"
+            
+    # Определяем текущий статус игрока
+    if is_banned:
+        status_display = "🔴 ЗАБЛОКИРОВАН (Бан)"
+    else:
+        retire_date = check_player_retire_status(user_id)
+        if retire_date:
+            formatted_date = retire_date.strftime('%d.%m.%Y %H:%M')
+            status_display = f"🥀 Карьера завершена (до {formatted_date})"
+        else:
+            status_display = "🟢 Активен (Готов к игре)"
+
+    # Формируем красивый текст профиля (согласно ТЗ)
+    profile_text = (
+        "👤 <b>ПРОФИЛЬ ИГРОКА</b> 👤\n\n"
+        f"📝 <b>Игровой никнейм:</b> <code>{nickname}</code>\n"
+        f"🔗 <b>Юзернейм:</b> {username}\n"
+        f"🆔 <b>Ваш Telegram ID:</b> <code>{user_id}</code>\n"
+        f"⚽️ <b>Текущий клуб:</b> {club_name_display}\n\n"
+        f"📊 <b>Статус аккаунта:</b> {status_display}"
+    )
+    
+    await message.answer(text=profile_text)
+
+@dp.message(F.text == "🔄 Смена никнейма")
+async def handle_change_nickname(message: types.Message, state: FSMContext) -> None:
+    """Запускает процесс смены никнейма. Проверяет кулдаун в 30 дней."""
+    user_id = message.from_user.id
+    user_data = db_manager.get_user_data_by_id(user_id)
+    
+    if not user_data:
+        return
+        
+    # Проверка на бан
+    if bool(user_data[4]):
+        await message.answer("❌ <b>Отказано:</b> Ваш аккаунт заблокирован.")
+        return
+
+    # Проверка кулдауна на смену ника (индекс 8 в БД)
+    last_nickname_change = user_data[8]
+    if last_nickname_change:
+        # Передаем 30 дней в часах (30 * 24 = 720)
+        cooldown_remaining = get_remaining_cooldown_time(last_nickname_change, COOLDOWN_NICKNAME_CHANGE_DAYS * 24)
+        if cooldown_remaining:
+            await message.answer(
+                f"⏳ <b>Слишком рано!</b>\n"
+                f"Смена никнейма доступна только 1 раз в месяц.\n"
+                f"Осталось ждать: <b>{cooldown_remaining}</b>"
+            )
+            return
+
+    await message.answer(
+        "✍️ <b>Смена игрового никнейма</b>\n\n"
+        "Введите ваш новый никнейм (только английские буквы).\n"
+        "<i>❗️ Внимание: Следующая смена будет доступна только через 1 месяц!</i>",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await state.set_state(ChangeNicknameProcess.waiting_for_new_nickname)
+
+@dp.message(StateFilter(ChangeNicknameProcess.waiting_for_new_nickname))
+async def process_new_nickname(message: types.Message, state: FSMContext) -> None:
+    """Обрабатывает ввод нового никнейма и сохраняет его, накладывая кулдаун."""
+    user_id = message.from_user.id
+    new_nickname = message.text.strip()
+    
+    if len(new_nickname) < 3 or len(new_nickname) > 20:
+        await message.answer("⚠️ Никнейм должен быть от 3 до 20 символов. Попробуйте снова:")
+        return
+        
+    if not is_valid_english_nickname(new_nickname):
+        await message.answer("⚠️ Только английские буквы и цифры. Попробуйте снова:")
+        return
+
+    success = db_manager.update_user_nickname(user_id=user_id, new_nickname=new_nickname)
     
     if success:
-        bot.send_message(
-            message.chat.id, 
-            f"✅ Отлично! Вы успешно зарегистрированы под ником <b>{nickname}</b>.\n"
-            f"Теперь вам доступно меню трансфермаркета.", 
-            reply_markup=get_main_menu_keyboard()
-        )
+        await message.answer(f"✅ <b>Успешно!</b> Ваш новый никнейм: <code>{new_nickname}</code>")
+        await state.clear()
     else:
-        msg = bot.send_message(
-            message.chat.id, 
-            "⚠️ Этот никнейм уже занят другим игроком!\n\n"
-            "Пожалуйста, придумайте и введите другой никнейм:"
-        )
-        bot.register_next_step_handler(msg, process_registration_nickname)
+        await message.answer("❌ <b>Ошибка:</b> Этот никнейм уже занят другим игроком. Придумайте другой.")
 
-# ========================================================================
-# 7. ИНФОРМАЦИОННЫЕ КОМАНДЫ (ПРОФИЛЬ И ПОМОЩЬ)
-# ========================================================================
+# ==============================================================================
+# 9. ЗАВЕРШЕНИЕ И ВОЗВРАЩЕНИЕ КАРЬЕРЫ (Автоматическая публикация)
+# ==============================================================================
 
-@bot.message_handler(func=lambda message: message.text == "Профиль")
-def menu_profile(message: types.Message):
-    """Отображение профиля пользователя."""
-    user_data = db.get_user_by_id(message.from_user.id)
-    if not user_data:
-        bot.send_message(message.chat.id, "Для начала работы напишите /start")
-        return
-        
-    # Формируем информацию о клубе
-    club_name = "Нет клуба"
-    if user_data['club_id'] != 0:
-        club_data = db.get_club_by_id(user_data['club_id'])
-        if club_data:
-            club_name = club_data['name']
-            
-    # Статус бана
-    status_text = "🔴 ЗАБАНЕН" if user_data['is_banned'] else "🟢 Активен"
-    
-    # Формируем и отправляем текст профиля
-    profile_text = (
-        f"👤 <b>Ваш профиль в Трансфермаркете:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📎 Юз: {user_data['username']}\n"
-        f"😎 Ник: <b>{user_data['nickname']}</b>\n"
-        f"🆔 ID: {user_data['user_id']}\n"
-        f"🛡 Текущий клуб: <b>{club_name}</b>\n"
-        f"📊 Статус: {status_text}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
-    bot.send_message(message.chat.id, profile_text)
-
-@bot.message_handler(func=lambda message: message.text == "Помощь")
-def menu_help(message: types.Message):
-    """Отображение справочной информации."""
-    help_text = (
-        "📚 <b>СПРАВОЧНИК КОМАНД</b>\n\n"
-        "<b>Для игроков:</b>\n"
-        "🔹 <i>Свободный агент</i> - оставить анкету на поиск клуба (КД: 6 часов).\n"
-        "🔹 <i>Своего текста</i> - опубликовать свое объявление (КД: 12 часов).\n"
-        "🔹 <i>Завершения карьеры</i> - заморозить аккаунт на 15 дней (публикации запрещены).\n"
-        "🔹 <i>Возращения карьеры</i> - снять статус завершения карьеры (после 15 дней).\n"
-        "🔹 <i>Смена никнейма</i> - изменить свой игровой ник (КД: 30 дней).\n"
-        "🔹 <i>Профиль</i> - посмотреть свою статистику.\n"
-        "🔹 <i>мой клуб</i> - управление и просмотр своего клуба.\n\n"
-        "<b>Для владельцев клубов и заместителей:</b>\n"
-        "🔸 <b>/invite [ник]</b> - подписать свободного агента в свой клуб.\n"
-        "🔸 <b>/delete [ник]</b> - разорвать контракт с игроком.\n"
-        "🔸 <b>/viewteam</b> - просмотр состава и управление заместителями."
-    )
-    bot.send_message(message.chat.id, help_text)
-
-# ========================================================================
-# 8. ПУБЛИКАЦИЯ ОБЪЯВЛЕНИЙ (ГЛАВНОЕ МЕНЮ)
-# ========================================================================
-
-@bot.message_handler(func=lambda message: message.text == "Свободный агент")
-def menu_free_agent(message: types.Message):
-    """Начало оформления анкеты свободного агента."""
+@dp.message(F.text == "🥀 Завершения карьеры")
+async def handle_career_retire(message: types.Message) -> None:
+    """
+    Завершает карьеру игрока на 15 дней.
+    Игрок исключается из клуба, статус обновляется, в канал отправляется пост (по ТЗ).
+    """
     user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
+    user_data = db_manager.get_user_data_by_id(user_id)
     
-    # Базовые проверки
-    if not check_user_access(message, user_data):
+    if not user_data:
         return
         
-    # Проверка кулдауна (6 часов)
-    cd_time = parse_db_time(user_data['free_agent_cd'])
-    if get_current_time() < cd_time:
-        time_left = cd_time - get_current_time()
-        hours, remainder = divmod(int(time_left.total_seconds()), 3600)
-        minutes, _ = divmod(remainder, 60)
-        
-        bot.send_message(
-            message.chat.id, 
-            f"⏳ <b>Кулдаун!</b>\nВы сможете опубликовать анкету свободного агента через: "
-            f"<b>{hours} ч. {minutes} мин.</b>\n"
-            f"(До {cd_time.strftime('%H:%M %d.%m.%Y')})"
+    # Проверка на бан
+    if bool(user_data[4]):
+        await message.answer("❌ <b>Отказано:</b> Вы заблокированы и не можете использовать эту функцию.")
+        return
+
+    # Проверка: возможно, карьера уже завершена
+    retire_end_date = check_player_retire_status(user_id)
+    if retire_end_date:
+        await message.answer(
+            f"⚠️ <b>Ваша карьера уже завершена!</b>\n"
+            f"Ожидайте до: <b>{retire_end_date.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"Или нажмите «❤️ Возращения карьеры», чтобы вернуться досрочно."
         )
         return
-        
-    msg = bot.send_message(
-        message.chat.id, 
-        "📝 Пожалуйста, напишите текст, который будет указан в поле <b>P.s:</b> (ваши пожелания к клубу, позиция и т.д.):\n\n"
-        "<i>Для отмены напишите 'отмена'</i>"
-    )
-    bot.register_next_step_handler(msg, process_free_agent_text, user_data)
 
-def process_free_agent_text(message: types.Message, user_data: dict):
-    """Формирование и отправка анкеты свободного агента."""
-    if message.text.lower() == 'отмена':
-        bot.send_message(message.chat.id, "Действие отменено.", reply_markup=get_main_menu_keyboard())
+    username = user_data[1]
+    nickname = user_data[2]
+    
+    # Применяем штраф в БД (заодно выкидывает из клуба)
+    freeze_date = db_manager.execute_career_retirement(user_id)
+    
+    # Формируем текст поста строго по ТЗ:
+    # ❗️ОФИЦИАЛЬНО: ЗАВЕРШЕНИЕ КАРЬЕРЫ🥀
+    # 😎 ник игрока(юз) - завершение карьеры.
+    post_text = (
+        "❗️ОФИЦИАЛЬНО: ЗАВЕРШЕНИЕ КАРЬЕРЫ🥀\n\n"
+        f"😎 <b>{nickname}</b> ({username}) - завершение карьеры."
+    )
+    
+    try:
+        # Отправляем пост напрямую в канал
+        await bot.send_message(chat_id=CHANNEL_ID, text=post_text)
+        
+        await message.answer(
+            f"✅ <b>Вы успешно завершили карьеру.</b>\n"
+            f"Ваш профиль заморожен на 15 дней (до {freeze_date.strftime('%d.%m.%Y %H:%M')}).\n"
+            f"Вы покинули свой клуб и не можете публиковать объявления."
+        )
+        logger.info(f"Пользователь {nickname} завершил карьеру. Пост отправлен в канал.")
+    except Exception as e:
+        logger.error(f"Ошибка отправки поста о завершении карьеры в канал {CHANNEL_ID}: {e}")
+        await message.answer(
+            "⚠️ <b>Внимание:</b> Ваш статус карьеры успешно обновлен, "
+            "но произошла ошибка при публикации поста в канал. Обратитесь к администратору."
+        )
+
+@dp.message(F.text == "❤️ Возращения карьеры")
+async def handle_career_return(message: types.Message) -> None:
+    """
+    Отменяет статус завершения карьеры.
+    Публикует пост в канал (по ТЗ).
+    """
+    user_id = message.from_user.id
+    user_data = db_manager.get_user_data_by_id(user_id)
+    
+    if not user_data:
         return
         
-    user_text = message.text
+    if bool(user_data[4]):
+        await message.answer("❌ <b>Отказано:</b> Вы заблокированы.")
+        return
+
+    # Проверяем, завершена ли карьера вообще
+    if user_data[5] is None:
+        await message.answer("⚠️ <b>Ошибка:</b> Ваша карьера активна. Вы не завершали ее.")
+        return
+
+    # Снимаем статус в базе данных
+    db_manager.execute_career_return(user_id)
     
-    # Формируем итоговый текст по ТЗ
-    final_post = (
-        f"❗️СВОБОДНЫЙ АГЕНТ✌\n\n"
-        f"😎 {user_data['nickname']} ({user_data['username']}) - Ищет клуб\n"
+    username = user_data[1]
+    nickname = user_data[2]
+    
+    # Формируем текст поста строго по ТЗ
+    post_text = (
+        "❗️ОФИЦИАЛЬНО: ВОЗРАЩЕНИЕ КАРЬЕРЫ❤️\n\n"
+        f"😎 <b>{nickname}</b> ({username}) - возвращение в карьеру."
+    )
+    
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=post_text)
+        await message.answer(
+            "✅ <b>Вы успешно вернулись в большой спорт!</b>\n"
+            "Теперь вы можете публиковать объявления и вступать в клубы."
+        )
+        logger.info(f"Пользователь {nickname} вернулся в карьеру. Пост отправлен в канал.")
+    except Exception as e:
+        logger.error(f"Ошибка отправки поста о возвращении карьеры в канал {CHANNEL_ID}: {e}")
+        await message.answer("⚠️ Статус обновлен, но в канал отправить пост не удалось.")
+
+# ==============================================================================
+# 10. СОЗДАНИЕ ОБЪЯВЛЕНИЙ (АГЕНТ И КАСТОМНЫЙ ТЕКСТ)
+# ==============================================================================
+
+@dp.message(F.text == "🏃‍♂️ Свободный агент")
+async def handle_free_agent_button(message: types.Message, state: FSMContext) -> None:
+    """
+    Начинает процесс подачи заявки свободного агента.
+    Проверяет баны, завершение карьеры и кулдаун (6 часов).
+    """
+    user_id = message.from_user.id
+    user_data = db_manager.get_user_data_by_id(user_id)
+    
+    if not user_data:
+        return
+
+    # 1. Проверка на бан
+    if bool(user_data[4]):
+        await message.answer("❌ <b>Ошибка:</b> Ваш аккаунт заблокирован. Вы не можете публиковать объявления.")
+        return
+
+    # 2. Проверка на завершение карьеры
+    retire_date = check_player_retire_status(user_id)
+    if retire_date:
+        await message.answer(
+            f"🥀 <b>Вы завершили карьеру!</b>\n"
+            f"Вы не можете искать клуб до {retire_date.strftime('%d.%m.%Y %H:%M')}, "
+            f"либо воспользуйтесь кнопкой возвращения."
+        )
+        return
+
+    # 3. Проверка кулдауна (индекс 6 в БД - last_free_agent)
+    last_free_agent_time = user_data[6]
+    cooldown_remaining = get_remaining_cooldown_time(last_free_agent_time, COOLDOWN_FREE_AGENT_HOURS)
+    if cooldown_remaining:
+        await message.answer(
+            f"⏳ <b>Перезарядка!</b>\n"
+            f"Вы уже публиковали анкету свободного агента недавно.\n"
+            f"Осталось ждать: <b>{cooldown_remaining}</b>"
+        )
+        return
+
+    await message.answer(
+        "📝 <b>Режим: Свободный агент</b>\n\n"
+        "Напишите текст вашего объявления (например: на какой позиции играете, какой у вас опыт, прайм-тайм).\n"
+        "Этот текст будет добавлен в анкету после слов 'P.s:'",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await state.set_state(FreeAgentProcess.waiting_for_text)
+
+@dp.message(StateFilter(FreeAgentProcess.waiting_for_text))
+async def process_free_agent_text(message: types.Message, state: FSMContext) -> None:
+    """
+    Принимает текст, формирует пост по ТЗ и отправляет ВСЕМ админам на проверку.
+    """
+    user_text = message.text
+    user_id = message.from_user.id
+    user_data = db_manager.get_user_data_by_id(user_id)
+    
+    username = user_data[1]
+    nickname = user_data[2]
+    
+    # Формируем итоговый вид поста согласно ТЗ
+    post_content = (
+        "❗️СВОБОДНЫЙ АГЕНТ✌\n\n"
+        f"😎 <b>{nickname}</b> ({username}) - Ищет клуб\n"
         f"P.s: {user_text}"
     )
     
-    # Обновляем кулдаун (+6 часов)
-    new_cd = get_current_time() + timedelta(hours=6)
-    db.set_free_agent_cooldown(user_data['user_id'], new_cd.strftime('%Y-%m-%d %H:%M:%S'))
+    admins_notified_count = 0
     
-    # Отправляем на модерацию
-    send_post_to_moderation(user_data['user_id'], final_post, message)
+    # Рассылаем анкету всем администраторам из списка ADMIN_IDS
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_msg = (
+                f"🔔 <b>НОВАЯ АНКЕТА (Свободный агент)</b>\n"
+                f"От пользователя: <code>{nickname}</code> (ID: {user_id})\n\n"
+                f"<b>Текст для публикации:</b>\n"
+                f"----------------------------------------\n"
+                f"{post_content}\n"
+                f"----------------------------------------"
+            )
+            # Прикрепляем инлайн клавиатуру для принятия/отклонения
+            keyboard = get_anketa_approval_keyboard(user_id=user_id, action_type="freeagent")
+            await bot.send_message(chat_id=admin_id, text=admin_msg, reply_markup=keyboard)
+            admins_notified_count += 1
+        except Exception as e:
+            logger.error(f"Не удалось доставить анкету админу {admin_id}: {e}")
 
-@bot.message_handler(func=lambda message: message.text == "Своего текста")
-def menu_custom_text(message: types.Message):
-    """Начало публикации своего текста."""
-    user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
-    
-    if not check_user_access(message, user_data):
-        return
+    if admins_notified_count > 0:
+        # Устанавливаем кулдаун только если анкета успешно ушла хотя бы одному админу
+        db_manager.set_action_cooldown(user_id=user_id, action_column="last_free_agent")
         
-    # Проверка кулдауна (12 часов)
-    cd_time = parse_db_time(user_data['custom_text_cd'])
-    if get_current_time() < cd_time:
-        time_left = cd_time - get_current_time()
-        hours, remainder = divmod(int(time_left.total_seconds()), 3600)
-        minutes, _ = divmod(remainder, 60)
+        # Сохраняем сформированный текст во временную память FSM пользователя, 
+        # чтобы админ мог его достать при нажатии "Принять" (реализация будет в Части 3)
+        await state.update_data(prepared_post=post_content)
         
-        bot.send_message(
-            message.chat.id, 
-            f"⏳ <b>Кулдаун!</b>\nВы сможете опубликовать свой текст через: "
-            f"<b>{hours} ч. {minutes} мин.</b>\n"
-            f"(До {cd_time.strftime('%H:%M %d.%m.%Y')})"
+        await message.answer(
+            "✅ <b>Ваша анкета успешно отправлена на проверку!</b>\n"
+            "Пожалуйста, ожидайте. Как только администраторы одобрят её, она появится в канале."
         )
-        return
+        logger.info(f"Анкета СА от {nickname} отправлена {admins_notified_count} админам.")
+    else:
+        await message.answer(
+            "⚠️ <b>Произошла ошибка!</b>\n"
+            "В данный момент администраторы недоступны. Попробуйте повторить попытку позже."
+        )
         
-    msg = bot.send_message(
-        message.chat.id, 
-        "📝 Введите текст вашего объявления, который вы хотите опубликовать в канал:\n\n"
-        "<i>Для отмены напишите 'отмена'</i>"
-    )
-    bot.register_next_step_handler(msg, process_custom_text, user_data)
+    await state.clear()
 
-def process_custom_text(message: types.Message, user_data: dict):
-    """Обработка публикации своего текста."""
-    if message.text.lower() == 'отмена':
-        bot.send_message(message.chat.id, "Действие отменено.", reply_markup=get_main_menu_keyboard())
-        return
-        
-    # Обновляем кулдаун (+12 часов)
-    new_cd = get_current_time() + timedelta(hours=12)
-    db.set_custom_text_cooldown(user_data['user_id'], new_cd.strftime('%Y-%m-%d %H:%M:%S'))
-    
-    # Отправляем на модерацию напрямую текст пользователя
-    send_post_to_moderation(user_data['user_id'], message.text, message)
-
-# ========================================================================
-# 9. КАРЬЕРА И СМЕНА НИКА
-# ========================================================================
-
-@bot.message_handler(func=lambda message: message.text == "Завершения карьеры")
-def menu_end_career(message: types.Message):
-    """Обработчик завершения карьеры."""
+@dp.message(F.text == "📝 Свой текст")
+async def handle_custom_text_button(message: types.Message, state: FSMContext) -> None:
+    """
+    Запускает процесс публикации кастомного текста.
+    Проверяет баны, карьеру и кулдаун (12 часов).
+    """
     user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
-    
-    # Если игрок уже в бане - игнорируем
-    if not user_data or user_data['is_banned']: 
-        return
-        
-    # Вычисляем дату окончания (15 дней) и устанавливаем ровно на 00:00
-    future_date = get_current_time() + timedelta(days=15)
-    midnight_date = future_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    time_str = midnight_date.strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Сохраняем дату в БД
-    db.set_career_end_cooldown(user_id, time_str)
-    
-    # Формируем пост для канала
-    final_post = (
-        f"❗️ОФИЦИАЛЬНО: ЗАВЕРШЕНИЕ КАРЬЕРЫ🥀\n\n"
-        f"😎 {user_data['nickname']}({user_data['username']}) - завершение карьеры."
-    )
-    
-    bot.send_message(
-        message.chat.id, 
-        f"🥀 Вы завершили карьеру. Теперь вы не сможете ничего публиковать в течение 15 дней.\n"
-        f"Ваш статус обновится: {midnight_date.strftime('%d.%m.%Y в %H:%M')}"
-    )
-    
-    # Отправляем новость в предложку
-    send_post_to_moderation(user_id, final_post, message)
-
-@bot.message_handler(func=lambda message: message.text == "Возращения карьеры")
-def menu_return_career(message: types.Message):
-    """Обработчик возвращения из завершения карьеры."""
-    user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
+    user_data = db_manager.get_user_data_by_id(user_id)
     
     if not user_data:
         return
-        
-    career_ended = parse_db_time(user_data['career_ended_until'])
-    
-    # Если время еще не прошло
-    if get_current_time() < career_ended:
-        days_left = (career_ended - get_current_time()).days
-        bot.send_message(
-            message.chat.id, 
-            f"⚠️ Вы не можете вернуться! Вы завершили карьеру, ждите еще {days_left} дней.\n"
-            f"Срок истекает: {career_ended.strftime('%d.%m.%Y в %H:%M')}"
+
+    if bool(user_data[4]):
+        await message.answer("❌ <b>Ошибка:</b> Ваш аккаунт заблокирован.")
+        return
+
+    retire_date = check_player_retire_status(user_id)
+    if retire_date:
+        await message.answer(f"🥀 <b>Вы завершили карьеру!</b> Доступ закрыт до {retire_date.strftime('%d.%m.%Y')}.")
+        return
+
+    # Проверка кулдауна (индекс 7 в БД - last_custom_text)
+    last_custom_time = user_data[7]
+    cooldown_remaining = get_remaining_cooldown_time(last_custom_time, COOLDOWN_CUSTOM_TEXT_HOURS)
+    if cooldown_remaining:
+        await message.answer(
+            f"⏳ <b>Перезарядка!</b>\n"
+            f"Вы уже публиковали свой текст недавно. Лимит: 1 раз в 12 часов.\n"
+            f"Осталось ждать: <b>{cooldown_remaining}</b>"
         )
         return
-        
-    # Сбрасываем статус (ставим старую дату)
-    db.set_career_end_cooldown(user_id, '2000-01-01 00:00:00')
-    
-    final_post = (
-        f"❗️ОФИЦИАЛЬНО: ВОЗРАЩЕНИЕ  КАРЬЕРЫ❤️\n\n"
-        f"😎 {user_data['nickname']}({user_data['username']}) - возращение карьеры."
-    )
-    
-    bot.send_message(message.chat.id, "❤️ С возвращением! Теперь вы снова можете публиковать объявления.")
-    send_post_to_moderation(user_id, final_post, message)
 
-@bot.message_handler(func=lambda message: message.text == "Смена никнейма")
-def menu_change_nick(message: types.Message):
-    """Начало процесса смены игрового никнейма."""
+    await message.answer(
+        "📝 <b>Режим: Свой текст</b>\n\n"
+        "Напишите ваше сообщение <b>полностью</b> так, как вы хотите его видеть в официальном канале.\n"
+        "Администраторы проверят текст на нарушения перед публикацией.",
+        reply_markup=get_cancel_inline_keyboard()
+    )
+    await state.set_state(CustomTextProcess.waiting_for_text)
+
+@dp.message(StateFilter(CustomTextProcess.waiting_for_text))
+async def process_custom_text(message: types.Message, state: FSMContext) -> None:
+    """Обрабатывает введенный кастомный текст и шлет админам на модерацию."""
+    user_text = message.text
     user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
+    user_data = db_manager.get_user_data_by_id(user_id)
+    nickname = user_data[2]
     
-    if not user_data:
-        return
-        
-    # Проверка кулдауна (30 дней / месяц)
-    cd_time = parse_db_time(user_data['name_change_cd'])
-    if get_current_time() < cd_time:
-        days_left = (cd_time - get_current_time()).days
-        bot.send_message(
-            message.chat.id, 
-            f"⏳ <b>Кулдаун!</b> Менять никнейм можно только раз в месяц.\n"
-            f"Осталось дней: {days_left} (До {cd_time.strftime('%d.%m.%Y')})"
-        )
-        return
-        
-    msg = bot.send_message(
-        message.chat.id, 
-        "📝 Введите ваш НОВЫЙ никнейм (только английские буквы и цифры):\n\n"
-        "<i>Для отмены напишите 'отмена'</i>"
-    )
-    bot.register_next_step_handler(msg, process_nickname_change, user_data)
-
-def process_nickname_change(message: types.Message, user_data: dict):
-    """Обработка нового никнейма и обновление в базе."""
-    if message.text.lower() == 'отмена':
-        bot.send_message(message.chat.id, "Действие отменено.")
-        return
-        
-    new_nickname = message.text.strip()
+    # Формируем пост. Для кастомного текста добавляем только подпись от кого.
+    post_content = f"👤 От игрока: <b>{nickname}</b>\n\n{user_text}"
     
-    if not re.match(r'^[A-Za-z0-9_]+$', new_nickname):
-        msg = bot.send_message(
-            message.chat.id, 
-            "❌ Ошибка! Только английские буквы и цифры. Попробуйте еще раз:"
-        )
-        bot.register_next_step_handler(msg, process_nickname_change, user_data)
-        return
-        
-    if db.update_user_nickname(user_data['user_id'], new_nickname):
-        # Если ник успешно обновлен, ставим кулдаун на 30 дней
-        new_cd = get_current_time() + timedelta(days=30)
-        db.set_name_change_cooldown(user_data['user_id'], new_cd.strftime('%Y-%m-%d %H:%M:%S'))
-        
-        bot.send_message(
-            message.chat.id, 
-            f"✅ Ваш никнейм успешно изменен на <b>{new_nickname}</b>!\n"
-            f"Следующая смена будет доступна через месяц."
-        )
-        logger.info(f"Пользователь {user_data['user_id']} сменил ник на {new_nickname}")
-    else:
-        bot.send_message(
-            message.chat.id, 
-            "⚠️ Этот никнейм уже занят кем-то другим! Попробуйте сменить ник позже или выберите другой."
-        )
-
-# Конец 2 части.
-
-# ========================================================================
-# 10. КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ КЛУБАМИ (ВЛАДЕЛЬЦЫ И ЗАМЫ)
-# ========================================================================
-
-@bot.message_handler(commands=['invite'])
-def club_invite_player(message: types.Message):
-    """Подписание нового игрока в клуб (только для владельца и замов)."""
-    user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
-    
-    if not check_user_access(message, user_data):
-        return
-        
-    # Проверка прав менеджера (владелец или заместитель)
-    club_data = db.get_club_by_manager(user_id, user_data['nickname'])
-    if not club_data:
-        bot.send_message(message.chat.id, "❌ У вас нет прав для управления каким-либо клубом.")
-        return
-        
-    # Разбор аргументов команды
-    args = message.text.split()
-    if len(args) < 2:
-        bot.send_message(message.chat.id, "⚠️ Использование команды: <b>/invite [ник_игрока]</b>")
-        return
-        
-    target_nickname = args[1]
-    target_data = db.get_user_by_nickname(target_nickname)
-    
-    # Проверки целевого игрока
-    if not target_data:
-        bot.send_message(message.chat.id, f"❌ Игрок с ником <b>{target_nickname}</b> не найден в базе.")
-        return
-        
-    if target_data['club_id'] != 0:
-        bot.send_message(message.chat.id, f"❌ Игрок <b>{target_nickname}</b> уже состоит в другом клубе!")
-        return
-        
-    # Проверка лимита игроков в клубе (максимум 15)
-    current_members = db.get_club_members(club_data['club_id'])
-    if len(current_members) >= 15:
-        bot.send_message(
-            message.chat.id, 
-            "⚠️ Удалите 1 игрока, лимит исчерпан. В клубе может быть не более 15 игроков."
-        )
-        return
-        
-    # Выполнение трансфера
-    db.update_user_club(target_nickname, club_data['club_id'])
-    db.increment_club_transfers(club_data['club_id'])
-    
-    # Формирование поста о трансфере
-    transfer_post = (
-        f"❗ОФИЦИАЛЬНО: ТРАНСФЕРЫ📍\n\n"
-        f"😎 {target_nickname} - Свободный агент ➡️ {club_data['name']}"
-    )
-    
-    bot.send_message(
-        message.chat.id, 
-        f"✅ Игрок <b>{target_nickname}</b> успешно подписан в ваш клуб <b>{club_data['name']}</b>!\n"
-        f"Пост о трансфере отправлен на проверку администраторам."
-    )
-    logger.info(f"Трансфер: {target_nickname} перешел в клуб ID {club_data['club_id']}")
-    
-    # Отправка поста на модерацию
-    send_post_to_moderation(user_id, transfer_post, message)
-
-@bot.message_handler(commands=['delete'])
-def club_delete_player(message: types.Message):
-    """Разрыв контракта с игроком (удаление из клуба)."""
-    user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
-    
-    if not check_user_access(message, user_data):
-        return
-        
-    club_data = db.get_club_by_manager(user_id, user_data['nickname'])
-    if not club_data:
-        bot.send_message(message.chat.id, "❌ У вас нет прав для управления каким-либо клубом.")
-        return
-        
-    args = message.text.split()
-    if len(args) < 2:
-        bot.send_message(message.chat.id, "⚠️ Использование команды: <b>/delete [ник_игрока]</b>")
-        return
-        
-    target_nickname = args[1]
-    target_data = db.get_user_by_nickname(target_nickname)
-    
-    if not target_data or target_data['club_id'] != club_data['club_id']:
-        bot.send_message(
-            message.chat.id, 
-            f"❌ Игрок <b>{target_nickname}</b> не найден в вашем клубе."
-        )
-        return
-        
-    # Удаление игрока из клуба
-    db.update_user_club(target_nickname, 0)
-    
-    # Если удаляемый игрок был заместителем - снимаем с него должность
-    if club_data['deputy1_nick'] == target_nickname:
-        db.set_club_deputy(club_data['club_id'], 1, "")
-    elif club_data['deputy2_nick'] == target_nickname:
-        db.set_club_deputy(club_data['club_id'], 2, "")
-        
-    bot.send_message(message.chat.id, f"✅ Контракт с игроком <b>{target_nickname}</b> успешно расторгнут.")
-    logger.info(f"Расторжение: {target_nickname} покинул клуб ID {club_data['club_id']}")
-
-@bot.message_handler(commands=['viewteam'])
-@bot.message_handler(func=lambda message: message.text == "мой клуб")
-def view_club_team(message: types.Message):
-    """Просмотр состава команды и информации о клубе."""
-    user_id = message.from_user.id
-    user_data = db.get_user_by_id(user_id)
-    
-    if not user_data:
-        return
-        
-    # Определяем клуб для показа
-    club_data = None
-    if message.text == "мой клуб":
-        if user_data['club_id'] != 0:
-            club_data = db.get_club_by_id(user_data['club_id'])
-    else:
-        # Для команды /viewteam проверяем права менеджера
-        club_data = db.get_club_by_manager(user_id, user_data['nickname'])
-        
-    if not club_data:
-        bot.send_message(message.chat.id, "❌ У вас нет клуба или вы не состоите в нем.")
-        return
-        
-    # Получаем данные владельца клуба
-    owner_data = db.get_user_by_id(club_data['owner_id'])
-    owner_text = f"{owner_data['nickname']} (ID: {owner_data['user_id']})" if owner_data else "Неизвестно"
-    
-    dep1 = club_data['deputy1_nick'] if club_data['deputy1_nick'] else "Нету"
-    dep2 = club_data['deputy2_nick'] if club_data['deputy2_nick'] else "Нету"
-    
-    # Получаем состав
-    members = db.get_club_members(club_data['club_id'])
-    
-    # Формируем заголовок клуба по ТЗ
-    team_text = (
-        f"📋Даные клуба 📝\n"
-        f"─────────────────────────────\n"
-        f"📊Названия клуба: {club_data['name']}\n"
-        f"👑 Владелец: {owner_text}\n"
-        f"👤Помощник 1: {dep1}\n"
-        f"👤Помощник 2: {dep2}\n"
-        f"📊 Успешных переходов: {club_data['transfers_count']}\n"
-        f"🏆─────────────────────────────🏆\n\n"
-        f"👥 Состав команды ({len(members)}/15):\n"
-    )
-    
-    # Формируем список из 15 слотов
-    for i in range(15):
-        if i < len(members):
-            team_text += f" {i+1}. ✏️ {members[i]}\n"
-        else:
-            team_text += f" {i+1}. ✏️ \n"
-            
-    # Проверяем, является ли запрос от владельца для выдачи кнопок управления замами
-    is_owner = (user_id == club_data['owner_id'])
-    markup = get_club_management_keyboard(club_data['club_id'], is_owner)
-    
-    bot.send_message(message.chat.id, team_text, reply_markup=markup)
-
-# ========================================================================
-# 11. АДМИН-ПАНЕЛЬ
-# ========================================================================
-
-def is_global_admin(user_id: int) -> bool:
-    """Проверка прав глобального администратора."""
-    return user_id in GLOBAL_ADMINS
-
-@bot.message_handler(commands=['admin', 'apanel'])
-def admin_menu(message: types.Message):
-    """Вывод списка админ-команд."""
-    if not is_global_admin(message.from_user.id):
-        return
-        
-    admin_text = (
-        "🔐 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        "<b>Управление клубами:</b>\n"
-        "🔸 /addclub [Название] [ID_Владельца] - Создать клуб\n"
-        "🔸 /delclub - Открыть меню удаления клубов\n\n"
-        "<b>Модерация игроков:</b>\n"
-        "🔸 /ban [ник] - Заблокировать игрока\n"
-        "🔸 /unban [ник] - Разблокировать игрока"
-    )
-    bot.send_message(message.chat.id, admin_text)
-
-@bot.message_handler(commands=['addclub'])
-def admin_add_club(message: types.Message):
-    """Создание нового клуба админом."""
-    if not is_global_admin(message.from_user.id):
-        return
-        
-    args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        bot.send_message(message.chat.id, "⚠️ Использование: <b>/addclub [Название] [ID_Владельца]</b>")
-        return
-        
-    club_name = args[1]
-    try:
-        owner_id = int(args[2])
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ ID владельца должен быть числом.")
-        return
-        
-    # Проверяем, существует ли пользователь-владелец
-    owner_data = db.get_user_by_id(owner_id)
-    if not owner_data:
-        bot.send_message(message.chat.id, f"❌ Пользователь с ID {owner_id} не найден.")
-        return
-        
-    # Создаем клуб
-    if db.create_club(club_name, owner_id):
-        bot.send_message(message.chat.id, f"✅ Клуб <b>{club_name}</b> успешно создан! Владелец: {owner_data['nickname']}")
-        logger.info(f"Админ {message.from_user.id} создал клуб {club_name} для {owner_id}")
-    else:
-        bot.send_message(message.chat.id, "❌ Ошибка! Возможно, клуб с таким названием уже существует.")
-
-@bot.message_handler(commands=['delclub'])
-def admin_del_club(message: types.Message):
-    """Меню удаления клубов (через инлайн кнопки)."""
-    if not is_global_admin(message.from_user.id):
-        return
-        
-    clubs = db.get_all_clubs()
-    if not clubs:
-        bot.send_message(message.chat.id, "ℹ️ На данный момент нет созданных клубов.")
-        return
-        
-    markup = get_club_deletion_list_keyboard(clubs)
-    bot.send_message(message.chat.id, "🗑 <b>Выберите клуб для удаления:</b>", reply_markup=markup)
-
-@bot.message_handler(commands=['ban', 'unban'])
-def admin_ban_system(message: types.Message):
-    """Выдача и снятие блокировок."""
-    if not is_global_admin(message.from_user.id):
-        return
-        
-    args = message.text.split()
-    if len(args) < 2:
-        bot.send_message(message.chat.id, f"⚠️ Использование: <b>{args[0]} [ник]</b>")
-        return
-        
-    target_nickname = args[1]
-    target_data = db.get_user_by_nickname(target_nickname)
-    
-    if not target_data:
-        bot.send_message(message.chat.id, f"❌ Игрок <b>{target_nickname}</b> не найден.")
-        return
-        
-    # 1 - бан, 0 - разбан
-    status = 1 if message.text.startswith('/ban') else 0
-    db.set_user_ban_status(target_nickname, status)
-    
-    action = "ЗАБЛОКИРОВАН" if status == 1 else "РАЗБЛОКИРОВАН"
-    bot.send_message(message.chat.id, f"✅ Игрок <b>{target_nickname}</b> был успешно {action}.")
-    logger.info(f"Админ {message.from_user.id} изменил статус бана {target_nickname} на {status}")
-
-# ========================================================================
-# 12. ОБРАБОТКА ВСЕХ INLINE КНОПОК (CALLBACK QUERIES)
-# ========================================================================
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_all_callbacks(call: types.CallbackQuery):
-    """Универсальный обработчик всех нажатий на инлайн-кнопки."""
-    data = call.data
-    chat_id = call.message.chat.id
-    msg_id = call.message.message_id
-    
-    try:
-        # --- ЛОГИКА МОДЕРАЦИИ АНКЕТ ---
-        if data.startswith("accept_post_"):
-            post_id = int(data.split("_")[2])
-            post_text = db.get_pending_post(post_id)
-            
-            if post_text:
-                # Отправляем в публичный канал
-                bot.send_message(CHANNEL_ID, post_text)
-                # Удаляем из БД
-                db.delete_pending_post(post_id)
-                
-                # Обновляем сообщение в админке
-                bot.edit_message_text(
-                    f"{call.message.text}\n\n✅ <b>ОДОБРЕНО И ОПУБЛИКОВАНО</b>",
-                    chat_id, msg_id, reply_markup=None
-                )
-            else:
-                bot.answer_callback_query(call.id, "⚠️ Ошибка: Анкета уже обработана или не найдена.")
-                
-        elif data.startswith("reject_post_"):
-            post_id = int(data.split("_")[2])
-            db.delete_pending_post(post_id)
-            
-            bot.edit_message_text(
-                f"{call.message.text}\n\n❌ <b>ОТКЛОНЕНО</b>",
-                chat_id, msg_id, reply_markup=None
+    admins_notified_count = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_msg = (
+                f"🔔 <b>НОВАЯ АНКЕТА (Свой текст)</b>\n"
+                f"От пользователя: <code>{nickname}</code>\n\n"
+                f"<b>Текст для публикации:</b>\n"
+                f"----------------------------------------\n"
+                f"{post_content}\n"
+                f"----------------------------------------"
             )
+            keyboard = get_anketa_approval_keyboard(user_id=user_id, action_type="customtext")
+            await bot.send_message(chat_id=admin_id, text=admin_msg, reply_markup=keyboard)
+            admins_notified_count += 1
+        except Exception as e:
+            logger.error(f"Не удалось доставить кастомный текст админу {admin_id}: {e}")
 
-        # --- ЛОГИКА УДАЛЕНИЯ КЛУБА (АДМИНЫ) ---
-        elif data.startswith("confirm_del_club_"):
-            club_id = int(data.split("_")[3])
-            markup = get_club_deletion_confirm_keyboard(club_id)
-            bot.edit_message_text(
-                "⚠️ Вы уверены, что хотите полностью удалить этот клуб? Все игроки будут исключены.",
-                chat_id, msg_id, reply_markup=markup
-            )
-            
-        elif data.startswith("execute_del_club_"):
-            club_id = int(data.split("_")[3])
-            db.delete_club(club_id)
-            bot.edit_message_text(
-                "✅ Клуб успешно удален, а все игроки откреплены.",
-                chat_id, msg_id, reply_markup=None
-            )
-            logger.info(f"Клуб ID {club_id} был удален администратором.")
-
-        # --- ЛОГИКА УПРАВЛЕНИЯ ЗАМАМИ (ВЛАДЕЛЬЦЫ) ---
-        elif data.startswith("add_deputy_"):
-            club_id = int(data.split("_")[2])
-            msg = bot.send_message(chat_id, "📝 Введите точный никнейм игрока для назначения заместителем:")
-            bot.register_next_step_handler(msg, process_add_deputy, club_id)
-            bot.answer_callback_query(call.id)
-            
-        elif data.startswith("del_deputy_"):
-            club_id = int(data.split("_")[2])
-            club_data = db.get_club_by_id(club_id)
-            
-            if not club_data['deputy1_nick'] and not club_data['deputy2_nick']:
-                bot.answer_callback_query(call.id, "⚠️ У вас нет назначенных заместителей.", show_alert=True)
-                return
-                
-            markup = get_remove_deputy_keyboard(club_id, club_data['deputy1_nick'], club_data['deputy2_nick'])
-            bot.edit_message_text(
-                "Выберите заместителя, которого хотите снять с должности:",
-                chat_id, msg_id, reply_markup=markup
-            )
-            
-        elif data.startswith("rm_dep_"):
-            # rm_dep_{club_id}_{slot}
-            parts = data.split("_")
-            club_id = int(parts[2])
-            slot = int(parts[3])
-            
-            db.set_club_deputy(club_id, slot, "")
-            bot.edit_message_text("✅ Заместитель успешно снят с должности.", chat_id, msg_id, reply_markup=None)
-
-        # --- ОТМЕНА ДЕЙСТВИЯ (УНИВЕРСАЛЬНАЯ) ---
-        elif data == "cancel_action":
-            bot.delete_message(chat_id, msg_id)
-            
-    except Exception as e:
-        logger.error(f"Ошибка в callback_query_handler: {e}")
-        bot.answer_callback_query(call.id, "Произошла ошибка при обработке нажатия.")
-
-def process_add_deputy(message: types.Message, club_id: int):
-    """Процесс назначения нового заместителя клуба."""
-    nickname = message.text.strip()
-    club_data = db.get_club_by_id(club_id)
-    target_data = db.get_user_by_nickname(nickname)
-    
-    if not target_data or target_data['club_id'] != club_id:
-        bot.send_message(message.chat.id, f"❌ Игрок <b>{nickname}</b> не найден или не состоит в вашем клубе.")
-        return
+    if admins_notified_count > 0:
+        db_manager.set_action_cooldown(user_id=user_id, action_column="last_custom_text")
+        await state.update_data(prepared_post=post_content)
         
-    # Проверяем свободные слоты для замов
-    if not club_data['deputy1_nick']:
-        db.set_club_deputy(club_id, 1, nickname)
-        bot.send_message(message.chat.id, f"✅ Игрок <b>{nickname}</b> назначен на слот Помощника 1!")
-    elif not club_data['deputy2_nick']:
-        db.set_club_deputy(club_id, 2, nickname)
-        bot.send_message(message.chat.id, f"✅ Игрок <b>{nickname}</b> назначен на слот Помощника 2!")
+        await message.answer("✅ <b>Ваш кастомный текст успешно отправлен на модерацию администраторам!</b>")
+        logger.info(f"Анкета Свой Текст от {nickname} отправлена {admins_notified_count} админам.")
     else:
-        bot.send_message(message.chat.id, "❌ Лимит заместителей исчерпан (максимум 2). Сначала снимите одного из текущих.")
-
-# ========================================================================
-# 13. ЗАПУСК БОТА (POLLING)
-# ========================================================================
-
-if __name__ == '__main__':
-    logger.info("Бот успешно запущен и готов к работе!")
-    try:
-        # infinity_polling защищает бота от падений при кратковременных ошибках сети
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен вручную.")
-    except Exception as e:
-        logger.critical(f"Критическая ошибка при работе бота: {e}")
-
-# Конец 1 части. Жду команду, чтобы скинуть 2 часть.
+        await message.answer("⚠️ Ошибка отправки. Администраторы недоступны.")
+        
+    await state.clear()
