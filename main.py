@@ -1,4 +1,8 @@
+Понял, сделаю всё в лучшем виде. Лови первую часть кода. Здесь находятся все настройки, импорты, клавиатуры и полностью обновленная база данных с поддержкой кулдаунов, которые мы обсуждали.
 
+**Часть 1: Настройки, клавиатуры и База Данных**
+
+```python
 import sqlite3
 import logging
 import sys
@@ -19,12 +23,14 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+import string
+from aiogram.filters import StateFilter
 
 # ==============================================================================
 # 1. КОНФИГУРАЦИЯ БОТА И КОНСТАНТЫ
 # ==============================================================================
 
-# Токен бота (из ТЗ)
+# Токен бота
 BOT_TOKEN = "8768994062:AAFWMZZIl19tDmnKjBcyFXEnE_BZLw5ckw0"
 
 # Первоначальные владельцы (добавляются в БД при первом запуске)
@@ -35,8 +41,6 @@ CHANNEL_ID = "-1004377865527"
 
 # Лимит игроков в одной команде
 CLUB_MAX_PLAYERS = 15
-
-# Кулдауны убраны по требованию ТЗ, все действия теперь доступны без задержек.
 
 # ==============================================================================
 # 2. НАСТРОЙКА ПРОФЕССИОНАЛЬНОГО ЛОГГИРОВАНИЯ
@@ -68,118 +72,59 @@ dp = Dispatcher()
 # ==============================================================================
 
 class UserRegistration(StatesGroup):
-    """Состояния для процесса регистрации нового пользователя в боте."""
     waiting_for_nickname = State()
 
 class FreeAgentProcess(StatesGroup):
-    """Состояния для подачи анкеты свободного агента."""
     waiting_for_text = State()
 
 class CustomTextProcess(StatesGroup):
-    """Состояния для подачи объявления со своим текстом."""
     waiting_for_text = State()
 
 class ChangeNicknameProcess(StatesGroup):
-    """Состояния для процесса смены игрового никнейма."""
     waiting_for_new_nickname = State()
 
 class SuperAdminProcess(StatesGroup):
-    """Состояния для расширенной админ-панели."""
     waiting_for_club_name = State()
     waiting_for_club_owner_id = State()
     waiting_for_ban_nickname = State()
     waiting_for_unban_nickname = State()
-    
-    # Новые состояния по ТЗ:
     waiting_for_new_admin_id = State()
     waiting_for_remove_admin_id = State()
     waiting_for_return_career_nick = State()
 
 class ClubManagementProcess(StatesGroup):
-    """Состояния для владельцев клубов (набор состава, управление замами)."""
     waiting_for_deputy_nickname = State()
     waiting_for_player_invite = State()
     waiting_for_player_kick = State()
 
 # ==============================================================================
-# 4. ФУНКЦИИ ГЕНЕРАЦИИ КЛАВИАТУР (ОФОРМЛЕНИЕ И ЭМОДЗИ)
+# 4. ФУНКЦИИ ГЕНЕРАЦИИ КЛАВИАТУР
 # ==============================================================================
 
 def get_player_main_menu(user_id: int, is_club_owner_or_deputy: bool = False, is_superadmin: bool = False) -> ReplyKeyboardMarkup:
-    """
-    Генерирует главную динамическую клавиатуру пользователя.
-    """
     builder = ReplyKeyboardBuilder()
-    
-    # Первый ряд кнопок (Публикации)
-    builder.row(
-        KeyboardButton(text="🏃‍♂️ Свободный агент"),
-        KeyboardButton(text="📝 Свой текст")
-    )
-    
-    # Второй ряд кнопок (Карьера)
-    builder.row(
-        KeyboardButton(text="🥀 Завершения карьеры"),
-        KeyboardButton(text="❤️ Возращения карьеры")
-    )
-    
-    # Третий ряд кнопок (Настройки и профиль)
-    builder.row(
-        KeyboardButton(text="🔄 Смена никнейма"),
-        KeyboardButton(text="👤 Профиль")
-    )
-    
-    # Четвертый ряд (Помощь)
-    builder.row(
-        KeyboardButton(text="ℹ️ Помощь")
-    )
+    builder.row(KeyboardButton(text="🏃‍♂️ Свободный агент"), KeyboardButton(text="📝 Свой текст"))
+    builder.row(KeyboardButton(text="🥀 Завершения карьеры"), KeyboardButton(text="❤️ Возращения карьеры"))
+    builder.row(KeyboardButton(text="🔄 Смена никнейма"), KeyboardButton(text="👤 Профиль"))
+    builder.row(KeyboardButton(text="ℹ️ Помощь"))
     
     if is_club_owner_or_deputy:
         builder.row(KeyboardButton(text="🛡 Мой клуб"))
-        
     if is_superadmin:
         builder.row(KeyboardButton(text="⚙️ Админ Панель"))
         
     return builder.as_markup(resize_keyboard=True)
 
 def get_superadmin_menu() -> ReplyKeyboardMarkup:
-    """
-    Клавиатура админ-панели с новыми кнопками управления администраторами и карьерой.
-    """
     builder = ReplyKeyboardBuilder()
-    
-    # Ряд 1: Клубы
-    builder.row(
-        KeyboardButton(text="➕ Добавить клуб"),
-        KeyboardButton(text="➖ Убрать клуб")
-    )
-    
-    # Ряд 2: Баны
-    builder.row(
-        KeyboardButton(text="🚫 Забанить игрока"),
-        KeyboardButton(text="✅ Разбанить игрока")
-    )
-    
-    # Ряд 3: Управление админами (Новое)
-    builder.row(
-        KeyboardButton(text="👑 Дать админа"),
-        KeyboardButton(text="🚫 Убрать админа")
-    )
-    
-    # Ряд 4: Принудительный возврат карьеры (Новое)
-    builder.row(
-        KeyboardButton(text="❤️ Вернуть карьеру игроку")
-    )
-    
-    # Ряд 5: Выход
-    builder.row(
-        KeyboardButton(text="🔙 Выйти из админ панели")
-    )
-    
+    builder.row(KeyboardButton(text="➕ Добавить клуб"), KeyboardButton(text="➖ Убрать клуб"))
+    builder.row(KeyboardButton(text="🚫 Забанить игрока"), KeyboardButton(text="✅ Разбанить игрока"))
+    builder.row(KeyboardButton(text="👑 Дать админа"), KeyboardButton(text="🚫 Убрать админа"))
+    builder.row(KeyboardButton(text="❤️ Вернуть карьеру игроку"))
+    builder.row(KeyboardButton(text="🔙 Выйти из админ панели"))
     return builder.as_markup(resize_keyboard=True)
 
 def get_anketa_approval_keyboard(user_id: int, action_type: str) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура для проверки анкет (Свободный агент / Свой текст)."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Принять", callback_data=f"approve_{action_type}_{user_id}")
     builder.button(text="❌ Отклонить", callback_data=f"reject_{action_type}_{user_id}")
@@ -187,7 +132,6 @@ def get_anketa_approval_keyboard(user_id: int, action_type: str) -> InlineKeyboa
     return builder.as_markup()
 
 def get_invite_player_keyboard(club_id: int, club_name: str) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура для игрока при получении приглашения в клуб."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Принять", callback_data=f"player_accept_invite_{club_id}")
     builder.button(text="❌ Отказать", callback_data=f"player_reject_invite_{club_id}")
@@ -195,7 +139,6 @@ def get_invite_player_keyboard(club_id: int, club_name: str) -> InlineKeyboardMa
     return builder.as_markup()
 
 def get_transfer_mod_keyboard(user_id: int, club_id: int) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура для модерации переходов (инвайтов) администраторами."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Одобрить переход", callback_data=f"mod_approve_transfer_{user_id}_{club_id}")
     builder.button(text="❌ Отклонить", callback_data=f"mod_reject_transfer_{user_id}_{club_id}")
@@ -215,15 +158,10 @@ def get_cancel_inline_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 # ==============================================================================
-# 5. БАЗА ДАННЫХ (Обновлена с удалением КД и добавлением админов)
+# 5. БАЗА ДАННЫХ (Обновлена с учетом кулдаунов)
 # ==============================================================================
 
 class DatabaseManager:
-    """
-    Класс для управления базой данных SQLite3.
-    Добавлена таблица для динамического списка администраторов.
-    Убраны все поля кулдаунов.
-    """
     def __init__(self, db_path: str = "rivals_database.db"):
         self.db_path = db_path
         self.connection = None
@@ -235,7 +173,7 @@ class DatabaseManager:
             self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self.cursor = self.connection.cursor()
             
-            # Таблица пользователей (убраны даты КД, retire_date заменен на флаг)
+            # Добавлены колонки кулдаунов
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -243,11 +181,13 @@ class DatabaseManager:
                     nickname TEXT UNIQUE COLLATE NOCASE,
                     club_id INTEGER DEFAULT NULL,
                     is_banned INTEGER DEFAULT 0,
-                    is_retired INTEGER DEFAULT 0
+                    is_retired INTEGER DEFAULT 0,
+                    free_agent_cd REAL DEFAULT 0,
+                    custom_text_cd REAL DEFAULT 0,
+                    retire_cd REAL DEFAULT 0
                 )
             ''')
             
-            # Таблица клубов
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS clubs (
                     club_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,14 +199,12 @@ class DatabaseManager:
                 )
             ''')
 
-            # Новая таблица: Администраторы бота
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS bot_admins (
                     admin_id INTEGER PRIMARY KEY
                 )
             ''')
             
-            # Добавление базовых админов, если таблица пуста
             for adm_id in INITIAL_ADMIN_IDS:
                 self.cursor.execute("INSERT OR IGNORE INTO bot_admins (admin_id) VALUES (?)", (adm_id,))
             
@@ -277,11 +215,22 @@ class DatabaseManager:
             sys.exit(1)
 
     # --------------------------------------------------------------------------
+    # МЕТОД ОБНОВЛЕНИЯ КУЛДАУНОВ
+    # --------------------------------------------------------------------------
+    def update_cooldown(self, user_id: int, cd_field: str, timestamp: float) -> bool:
+        allowed_fields = ['free_agent_cd', 'custom_text_cd', 'retire_cd']
+        if cd_field not in allowed_fields: return False
+        try:
+            self.cursor.execute(f"UPDATE users SET {cd_field} = ? WHERE user_id = ?", (timestamp, user_id))
+            self.connection.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    # --------------------------------------------------------------------------
     # УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
     # --------------------------------------------------------------------------
-    
     def get_all_admins(self) -> List[int]:
-        """Возвращает список ID всех администраторов бота."""
         try:
             self.cursor.execute("SELECT admin_id FROM bot_admins")
             return [row[0] for row in self.cursor.fetchall()]
@@ -289,7 +238,6 @@ class DatabaseManager:
             return INITIAL_ADMIN_IDS
 
     def is_admin(self, user_id: int) -> bool:
-        """Проверяет, является ли пользователь администратором бота."""
         try:
             self.cursor.execute("SELECT 1 FROM bot_admins WHERE admin_id = ?", (user_id,))
             return bool(self.cursor.fetchone())
@@ -297,31 +245,26 @@ class DatabaseManager:
             return False
 
     def add_bot_admin(self, admin_id: int) -> bool:
-        """Добавляет нового администратора по ID."""
         try:
             self.cursor.execute("INSERT INTO bot_admins (admin_id) VALUES (?)", (admin_id,))
             self.connection.commit()
             return True
         except sqlite3.IntegrityError:
             return False
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка добавления админа {admin_id}: {e}")
+        except sqlite3.Error:
             return False
 
     def remove_bot_admin(self, admin_id: int) -> bool:
-        """Удаляет администратора по ID."""
         try:
             self.cursor.execute("DELETE FROM bot_admins WHERE admin_id = ?", (admin_id,))
             self.connection.commit()
             return self.cursor.rowcount > 0
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка удаления админа {admin_id}: {e}")
+        except sqlite3.Error:
             return False
 
     # --------------------------------------------------------------------------
-    # УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ И КАРЬЕРОЙ (Без КД)
+    # УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ И КАРЬЕРОЙ
     # --------------------------------------------------------------------------
-    
     def add_new_user(self, user_id: int, username: str, nickname: str) -> bool:
         try:
             self.cursor.execute('''
@@ -348,52 +291,32 @@ class DatabaseManager:
             return None
 
     def update_user_nickname(self, user_id: int, new_nickname: str) -> bool:
-        """Обновление никнейма (без кулдауна)."""
         try:
-            self.cursor.execute('''
-                UPDATE users 
-                SET nickname = ? 
-                WHERE user_id = ?
-            ''', (new_nickname, user_id))
+            self.cursor.execute('UPDATE users SET nickname = ? WHERE user_id = ?', (new_nickname, user_id))
             self.connection.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
     def execute_career_retirement(self, user_id: int) -> bool:
-        """Завершение карьеры (без таймера, просто смена флага и выход из клуба)."""
         try:
-            self.cursor.execute('''
-                UPDATE users 
-                SET is_retired = 1, club_id = NULL 
-                WHERE user_id = ?
-            ''', (user_id,))
+            self.cursor.execute('UPDATE users SET is_retired = 1, club_id = NULL WHERE user_id = ?', (user_id,))
             self.connection.commit()
             return True
         except sqlite3.Error:
             return False
 
     def execute_career_return(self, user_id: int) -> bool:
-        """Возвращение карьеры (снимает флаг)."""
         try:
-            self.cursor.execute('''
-                UPDATE users 
-                SET is_retired = 0 
-                WHERE user_id = ?
-            ''', (user_id,))
+            self.cursor.execute('UPDATE users SET is_retired = 0 WHERE user_id = ?', (user_id,))
             self.connection.commit()
             return True
         except sqlite3.Error:
             return False
             
     def force_return_career_by_nick(self, nickname: str) -> bool:
-        """Принудительное возвращение карьеры администратором по никнейму."""
         try:
-            self.cursor.execute('''
-                UPDATE users 
-                SET is_retired = 0 
-                WHERE nickname = ?
-            ''', (nickname,))
+            self.cursor.execute('UPDATE users SET is_retired = 0 WHERE nickname = ?', (nickname,))
             self.connection.commit()
             return self.cursor.rowcount > 0
         except sqlite3.Error:
@@ -410,7 +333,6 @@ class DatabaseManager:
     # --------------------------------------------------------------------------
     # МЕТОДЫ УПРАВЛЕНИЯ КЛУБАМИ 
     # --------------------------------------------------------------------------
-
     def create_new_club(self, club_name: str, owner_id: int) -> bool:
         try:
             self.cursor.execute("INSERT INTO clubs (club_name, owner_id) VALUES (?, ?)", (club_name, owner_id))
@@ -514,17 +436,11 @@ class DatabaseManager:
 # Инициализируем глобальный объект базы данных
 db_manager = DatabaseManager()
 
-import string
-from aiogram.filters import StateFilter
-
 # ==============================================================================
 # 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ВАЛИДАЦИЯ)
 # ==============================================================================
 
 def is_valid_english_nickname(nickname: str) -> bool:
-    """
-    Проверяет, состоит ли никнейм только из английских букв, цифр и подчеркиваний.
-    """
     if not nickname:
         return False
         
@@ -541,9 +457,6 @@ def is_valid_english_nickname(nickname: str) -> bool:
 
 @dp.message(CommandStart())
 async def command_start_handler(message: types.Message, state: FSMContext) -> None:
-    """
-    Обработчик команды /start. Приветствует пользователя, проверяет наличие в БД.
-    """
     user_id = message.from_user.id
     username = message.from_user.username
     formatted_username = f"@{username}" if username else "Скрыт"
@@ -556,7 +469,6 @@ async def command_start_handler(message: types.Message, state: FSMContext) -> No
     if user_data:
         nickname = user_data[2]
         
-        # Проверяем права для выдачи соответствующих кнопок
         club_data = db_manager.get_club_by_admin_rights(user_id)
         is_club_admin = bool(club_data)
         is_superadmin = db_manager.is_admin(user_id)
@@ -629,10 +541,10 @@ async def handle_help_button(message: types.Message) -> None:
         "🔄 <b>Смена никнейма</b> — Изменить игровой ник.\n"
         "👤 <b>Профиль</b> — Просмотр статистики.\n\n"
         "<b>Команды Владельцев клубов:</b>\n"
-        "<code>/invite [ник]</code> — Подписать игрока (требует согласия игрока и одобрения админа)\n"
-        "<code>/delete [ник]</code> — Разорвать контракт с игроком\n"
+        "<code>/invite [ник]</code> — Подписать игрока\n"
+        "<code>/delete [ник]</code> — Разорвать контракт\n"
         "<code>/viewteam</code> — Информация о клубе\n\n"
-        "<i>❗️ Все публикации и трансферы проходят проверку администраторами.</i>"
+        "<i>❗️ Все публикации и трансферы проходят проверку.</i>"
     )
     await message.answer(text=help_message)
 
@@ -702,7 +614,7 @@ async def process_new_nickname(message: types.Message, state: FSMContext) -> Non
         await message.answer("❌ <b>Ошибка:</b> Никнейм занят. Придумайте другой.")
 
 # ==============================================================================
-# 9. ЗАВЕРШЕНИЕ И ВОЗВРАЩЕНИЕ КАРЬЕРЫ (Отправка на проверку Админам)
+# 9. ЗАВЕРШЕНИЕ И ВОЗВРАЩЕНИЕ КАРЬЕРЫ (С КУЛДАУНОМ 15 ДНЕЙ)
 # ==============================================================================
 
 @dp.message(F.text == "🥀 Завершения карьеры")
@@ -714,6 +626,17 @@ async def handle_career_retire(message: types.Message, state: FSMContext) -> Non
     if bool(user_data[5]):
         await message.answer("⚠️ <b>Ваша карьера уже завершена!</b>")
         return
+
+    # Проверка кулдауна (15 дней)
+    if not db_manager.is_admin(user_id):
+        current_time = datetime.now().timestamp()
+        cd_time = user_data[8] if len(user_data) > 8 and user_data[8] else 0
+        if current_time < cd_time:
+            rem = cd_time - current_time
+            days, remainder = divmod(rem, 86400)
+            hours, _ = divmod(remainder, 3600)
+            await message.answer(f"⏳ <b>Кулдаун!</b> Завершить карьеру снова можно будет через {int(days)}д {int(hours)}ч.")
+            return
 
     post_content = f"❗️ОФИЦИАЛЬНО: ЗАВЕРШЕНИЕ КАРЬЕРЫ🥀\n\n😎 <b>{user_data[2]}</b> ({user_data[1]}) - завершение карьеры."
     
@@ -727,6 +650,10 @@ async def handle_career_retire(message: types.Message, state: FSMContext) -> Non
 
     await state.update_data(prepared_post=post_content)
     await message.answer("✅ <b>Заявка на завершение карьеры отправлена администраторам!</b>\nОжидайте одобрения.")
+    
+    # Выдача кулдауна 15 дней (15 * 24 * 60 * 60 = 1296000 секунд)
+    if not db_manager.is_admin(user_id):
+        db_manager.update_cooldown(user_id, 'retire_cd', datetime.now().timestamp() + 15 * 86400)
 
 @dp.message(F.text == "❤️ Возращения карьеры")
 async def handle_career_return(message: types.Message, state: FSMContext) -> None:
@@ -752,7 +679,7 @@ async def handle_career_return(message: types.Message, state: FSMContext) -> Non
     await message.answer("✅ <b>Заявка на возвращение отправлена администраторам на проверку!</b>")
 
 # ==============================================================================
-# 10. СОЗДАНИЕ ОБЪЯВЛЕНИЙ (АГЕНТ И КАСТОМНЫЙ ТЕКСТ)
+# 10. СОЗДАНИЕ ОБЪЯВЛЕНИЙ (С КУЛДАУНАМИ)
 # ==============================================================================
 
 @dp.message(F.text == "🏃‍♂️ Свободный агент")
@@ -767,6 +694,17 @@ async def handle_free_agent_button(message: types.Message, state: FSMContext) ->
     if bool(user_data[5]):
         await message.answer("🥀 <b>Вы завершили карьеру!</b> Сначала вернитесь в спорт.")
         return
+
+    # Проверка кулдауна (6 часов)
+    if not db_manager.is_admin(user_id):
+        current_time = datetime.now().timestamp()
+        cd_time = user_data[6] if len(user_data) > 6 and user_data[6] else 0
+        if current_time < cd_time:
+            rem = cd_time - current_time
+            hours, remainder = divmod(rem, 3600)
+            minutes, _ = divmod(remainder, 60)
+            await message.answer(f"⏳ <b>Кулдаун!</b> Вы сможете подать анкету через {int(hours)}ч {int(minutes)}м.")
+            return
 
     await message.answer(
         "📝 <b>Режим: Свободный агент</b>\n\nНапишите текст вашего объявления (позиция, прайм-тайм и т.д.):",
@@ -791,6 +729,10 @@ async def process_free_agent_text(message: types.Message, state: FSMContext) -> 
     await state.update_data(prepared_post=post_content)
     await message.answer("✅ <b>Анкета отправлена на проверку администраторам!</b>")
     await state.clear()
+    
+    # Выдача кулдауна 6 часов (6 * 3600 = 21600 секунд)
+    if not db_manager.is_admin(user_id):
+        db_manager.update_cooldown(user_id, 'free_agent_cd', datetime.now().timestamp() + 6 * 3600)
 
 @dp.message(F.text == "📝 Свой текст")
 async def handle_custom_text_button(message: types.Message, state: FSMContext) -> None:
@@ -804,6 +746,17 @@ async def handle_custom_text_button(message: types.Message, state: FSMContext) -
     if bool(user_data[5]):
         await message.answer("🥀 <b>Вы завершили карьеру!</b>")
         return
+
+    # Проверка кулдауна (12 часов)
+    if not db_manager.is_admin(user_id):
+        current_time = datetime.now().timestamp()
+        cd_time = user_data[7] if len(user_data) > 7 and user_data[7] else 0
+        if current_time < cd_time:
+            rem = cd_time - current_time
+            hours, remainder = divmod(rem, 3600)
+            minutes, _ = divmod(remainder, 60)
+            await message.answer(f"⏳ <b>Кулдаун!</b> Свой текст можно опубликовать через {int(hours)}ч {int(minutes)}м.")
+            return
 
     await message.answer(
         "📝 <b>Режим: Свой текст</b>\nНапишите сообщение полностью, как хотите видеть его в канале:",
@@ -828,6 +781,10 @@ async def process_custom_text(message: types.Message, state: FSMContext) -> None
     await state.update_data(prepared_post=post_content)
     await message.answer("✅ <b>Ваш текст отправлен на модерацию!</b>")
     await state.clear()
+    
+    # Выдача кулдауна 12 часов (12 * 3600 = 43200 секунд)
+    if not db_manager.is_admin(user_id):
+        db_manager.update_cooldown(user_id, 'custom_text_cd', datetime.now().timestamp() + 12 * 3600)
 
 # ==============================================================================
 # 11. ОТМЕНА ДЕЙСТВИЙ (КОЛБЕК)
@@ -839,55 +796,35 @@ async def cancel_fsm_action(callback: types.CallbackQuery, state: FSMContext) ->
     await callback.message.edit_text("❌ <b>Действие отменено.</b> Вы вернулись в главное меню.")
     await callback.answer()
 
-"""
-================================================================================
-ТРАНСФЕРМАРКЕТ БОТ ПО ИГРЕ RIVALS (ROBLOX)
-ЧАСТЬ 3: Модерация, Управление Клубами (Инвайты) и Админ Панель.
-================================================================================
-"""
-
 # ==============================================================================
 # 12. МОДЕРАЦИЯ АНКЕТ АДМИНИСТРАТОРАМИ (Включая карьеру)
 # ==============================================================================
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def process_anketa_approval(callback: types.CallbackQuery) -> None:
-    """
-    Обрабатывает нажатие кнопки "✅ Принять" администратором.
-    Универсально для Свободного агента, Своего текста, Завершения и Возврата карьеры.
-    """
     parts = callback.data.split("_")
     action_type = parts[1]
     user_id = int(parts[2])
     
-    # Парсим текст поста, который был отправлен админу (отрезаем шапку уведомления)
     original_text = callback.message.text
     try:
-        # Разделяем по двойному переносу строки и берем все, что после шапки
         post_content = "\n\n".join(original_text.split("\n\n")[1:])
     except IndexError:
         await callback.answer("❌ Ошибка парсинга сообщения.", show_alert=True)
         return
 
     try:
-        # Если это завершение карьеры, применяем статус в БД
         if action_type == "retire":
             db_manager.execute_career_retirement(user_id)
             user_msg = "✅ <b>Одобрено:</b> Ваша заявка на завершение карьеры принята и опубликована!"
-        # Если это возвращение карьеры, снимаем статус в БД
         elif action_type == "return":
             db_manager.execute_career_return(user_id)
             user_msg = "✅ <b>Одобрено:</b> Ваша заявка на возвращение карьеры принята и опубликована!"
         else:
             user_msg = "🎉 <b>Отличные новости!</b> Ваша анкета проверена администратором и успешно опубликована!"
 
-        # Публикуем пост в канал
         await bot.send_message(chat_id=CHANNEL_ID, text=post_content)
-        
-        # Обновляем сообщение у админа
         await callback.message.edit_text(f"✅ <b>ОДОБРЕНО И ОПУБЛИКОВАНО</b>\n\n{post_content}")
-        
-        # Уведомляем игрока
         await bot.send_message(chat_id=user_id, text=user_msg)
     except Exception as e:
         logger.error(f"Ошибка публикации одобренного поста: {e}")
@@ -895,7 +832,6 @@ async def process_anketa_approval(callback: types.CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def process_anketa_rejection(callback: types.CallbackQuery) -> None:
-    """Обрабатывает нажатие кнопки "❌ Отклонить" администратором."""
     parts = callback.data.split("_")
     action_type = parts[1]
     user_id = int(parts[2])
@@ -916,7 +852,6 @@ async def process_anketa_rejection(callback: types.CallbackQuery) -> None:
 
 @dp.message(Command("invite"))
 async def club_command_invite(message: types.Message) -> None:
-    """Команда /invite [ник]. Отправляет запрос игроку на вступление."""
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     
@@ -959,7 +894,6 @@ async def club_command_invite(message: types.Message) -> None:
         await message.answer("❌ Этот игрок завершил карьеру и не может вступить в клуб.")
         return
 
-    # Отправляем запрос самому игроку
     invite_text = (
         f"📩 <b>ПРЕДЛОЖЕНИЕ КОНТРАКТА</b> 📩\n\n"
         f"Клуб <b>{club_name}</b> приглашает вас стать частью их команды!\n"
@@ -978,7 +912,6 @@ async def club_command_invite(message: types.Message) -> None:
 
 @dp.callback_query(F.data.startswith("player_accept_invite_"))
 async def player_accept_invite(callback: types.CallbackQuery) -> None:
-    """Игрок принял инвайт -> отправляем на модерацию админам."""
     user_id = callback.from_user.id
     club_id = int(callback.data.split("_")[3])
     
@@ -994,7 +927,6 @@ async def player_accept_invite(callback: types.CallbackQuery) -> None:
     
     await callback.message.edit_text(f"✅ Вы приняли приглашение от <b>{club_name}</b>!\n⏳ Трансфер отправлен на проверку администраторам.")
     
-    # Отправка на проверку админам
     admins = db_manager.get_all_admins()
     for admin_id in admins:
         try:
@@ -1010,12 +942,10 @@ async def player_accept_invite(callback: types.CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("player_reject_invite_"))
 async def player_reject_invite(callback: types.CallbackQuery) -> None:
-    """Игрок отклонил инвайт."""
     await callback.message.edit_text("❌ Вы отклонили предложение о контракте.")
 
 @dp.callback_query(F.data.startswith("mod_approve_transfer_"))
 async def mod_approve_transfer(callback: types.CallbackQuery) -> None:
-    """Админ одобрил трансфер."""
     parts = callback.data.split("_")
     target_id = int(parts[3])
     club_id = int(parts[4])
@@ -1030,7 +960,6 @@ async def mod_approve_transfer(callback: types.CallbackQuery) -> None:
     nickname = user_data[2]
     club_name = club_data[1]
     
-    # Совершаем переход в БД
     success = db_manager.change_player_club(user_id=target_id, new_club_id=club_id)
     if success:
         db_manager.add_transfer_count(club_id)
@@ -1050,7 +979,6 @@ async def mod_approve_transfer(callback: types.CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("mod_reject_transfer_"))
 async def mod_reject_transfer(callback: types.CallbackQuery) -> None:
-    """Админ отклонил трансфер."""
     parts = callback.data.split("_")
     target_id = int(parts[3])
     
@@ -1061,7 +989,6 @@ async def mod_reject_transfer(callback: types.CallbackQuery) -> None:
 
 @dp.message(Command("delete"))
 async def club_command_delete(message: types.Message) -> None:
-    """Команда /delete [ник]. Удаляет игрока из клуба."""
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     
@@ -1108,7 +1035,6 @@ async def club_command_delete(message: types.Message) -> None:
 @dp.message(Command("viewteam"))
 @dp.message(F.text == "🛡 Мой клуб")
 async def club_command_viewteam(message: types.Message) -> None:
-    """Показывает статистику клуба и состав."""
     user_id = message.from_user.id
     club_data = db_manager.get_club_by_admin_rights(user_id)
     
@@ -1204,7 +1130,7 @@ async def handle_deputy_nickname(message: types.Message, state: FSMContext) -> N
     await state.clear()
 
 # ==============================================================================
-# 14. СЕКРЕТНАЯ АДМИН ПАНЕЛЬ (ВКЛЮЧАЯ НОВЫЕ КНОПКИ)
+# 14. СЕКРЕТНАЯ АДМИН ПАНЕЛЬ
 # ==============================================================================
 
 @dp.message(F.text == "⚙️ Админ Панель")
@@ -1217,8 +1143,6 @@ async def superadmin_panel_close(message: types.Message) -> None:
     if not db_manager.is_admin(message.from_user.id): return
     keyboard = get_player_main_menu(message.from_user.id, bool(db_manager.get_club_by_admin_rights(message.from_user.id)), True)
     await message.answer("Вы вышли из админ-панели.", reply_markup=keyboard)
-
-# -- Управление админами --
 
 @dp.message(F.text == "👑 Дать админа")
 async def superadmin_give_admin(message: types.Message, state: FSMContext) -> None:
@@ -1254,7 +1178,6 @@ async def process_remove_admin(message: types.Message, state: FSMContext) -> Non
         return
         
     admin_id = int(message.text)
-    # Защита от снятия самого себя
     if admin_id == message.from_user.id:
         await message.answer("❌ Вы не можете снять админку с самого себя.")
         await state.clear()
@@ -1265,8 +1188,6 @@ async def process_remove_admin(message: types.Message, state: FSMContext) -> Non
     else:
         await message.answer("❌ Этот ID не найден в списке администраторов.")
     await state.clear()
-
-# -- Принудительное возвращение карьеры --
 
 @dp.message(F.text == "❤️ Вернуть карьеру игроку")
 async def superadmin_return_career(message: types.Message, state: FSMContext) -> None:
@@ -1283,8 +1204,6 @@ async def process_return_career(message: types.Message, state: FSMContext) -> No
     else:
         await message.answer(f"❌ Игрок <code>{target_nick}</code> не найден.")
     await state.clear()
-
-# -- Стандартное управление клубами и банами (из 1 части) --
 
 @dp.message(F.text == "➕ Добавить клуб")
 async def superadmin_add_club_start(message: types.Message, state: FSMContext) -> None:
@@ -1387,7 +1306,6 @@ async def superadmin_unban_execute(message: types.Message, state: FSMContext) ->
 # ==============================================================================
 
 async def main() -> None:
-    """Точка входа. Запуск процесса polling."""
     logger.info("Бот Трансфермаркета успешно запущен и готов к работе!")
     await bot.delete_webhook(drop_pending_updates=True)
     
