@@ -24,7 +24,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # ==============================================================================
 
 # Токен бота (из ТЗ)
-BOT_TOKEN = "8768994062:AAFWMZZIl19tDmnKjBcyFXEnE_BZLw5ckw0"
+BOT_TOKEN = "8958284742:AAEkWj4rMUgId7KAMTu01-PI-urbWW11uME"
 
 # Список ID владельцев (администраторов) (из ТЗ)
 ADMIN_IDS = [6885478196, 5845609895]
